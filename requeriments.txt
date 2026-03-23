@@ -1,0 +1,1 @@
+pip install PyMuPDF Pillow opencv-python-headless imagehash scikit-image numpy
