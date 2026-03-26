@@ -8,6 +8,7 @@ from pathlib import Path
 
 def checar_dependencias():
     faltando = []
+    # Dependências obrigatórias — app não inicia sem elas
     libs = [
         ("fitz",        "PyMuPDF"),
         ("PIL",         "Pillow"),
@@ -22,6 +23,7 @@ def checar_dependencias():
             __import__(modulo)
         except ImportError:
             faltando.append(nome_pip)
+    # spaCy é opcional — NER usa fallback se não estiver disponível
     return faltando
 
 
@@ -89,9 +91,9 @@ FORMATOS_JORNAL = {
 #   largura_cm, altura_cm, num_colunas, margem_cm (espaco entre colunas)
 # A largura de 1 coluna = (largura_cm - margem_cm * (num_colunas-1)) / num_colunas
 JORNAIS_CADASTRADOS = {
-    "Meu Jornal (28.5x52cm, 9col)": {
+    "Meu Jornal (28.5x52cm, 6col)": {
         "largura": 28.5, "altura": 52.0,
-        "colunas": 9,    "margem": 0.3,
+        "colunas": 6,    "margem": 0.3,
     },
     "A Tarde (56x32cm, 9col)": {
         "largura": 56.0, "altura": 32.0,
@@ -144,6 +146,62 @@ def largura_de_n_colunas(n, jornal):
     return lc * n + jornal["margem"] * (n - 1)
 
 
+def identificar_coluna_inicial(x_cm, jornal):
+    """Retorna o numero da coluna (1-based) onde o item comeca."""
+    lc = largura_coluna(jornal)
+    passo = lc + jornal["margem"]
+    if passo <= 0:
+        return 1
+    col = int(x_cm / passo) + 1
+    return max(1, min(col, jornal["colunas"]))
+
+
+def calcular_faixa_colunas(x_cm, w_cm, jornal):
+    """Retorna (col_inicial, col_final, num_colunas_largura)."""
+    col_ini = identificar_coluna_inicial(x_cm or 0.0, jornal)
+    num_col = calcular_colunas(w_cm, jornal)
+    col_fim = min(col_ini + num_col - 1, jornal["colunas"])
+    return col_ini, col_fim, num_col
+
+
+def calcular_info_colunas(w_cm, x_cm, jornal):
+    """Calcula colunagem com maxima precisao.
+    Retorna dict:
+      num_col    - numero inteiro de colunas (melhor ajuste)
+      cols_exato - colunas exatas como float
+      larg_padrao- largura teorica para num_col colunas (cm)
+      larg_1col  - largura de 1 coluna (cm)
+      margem     - margem entre colunas (cm)
+      desvio     - diferenca entre medido e padrao (cm)
+      col_ini    - coluna inicial (1-based)
+      col_fim    - coluna final (1-based)
+    """
+    lc    = largura_coluna(jornal)
+    marg  = jornal["margem"]
+    passo = lc + marg   # largura de 1 col + 1 margem
+
+    # Formula exata: w = lc*n + marg*(n-1)  =>  n = (w + marg) / (lc + marg)
+    cols_exato  = (w_cm + marg) / passo if passo > 0 else 1.0
+    # Arredonda para o numero de colunas mais proximo dentro do limite do jornal
+    num_col     = max(1, min(round(cols_exato), jornal["colunas"]))
+    larg_padrao = lc * num_col + marg * (num_col - 1)
+    desvio      = w_cm - larg_padrao
+
+    col_ini = identificar_coluna_inicial(x_cm or 0.0, jornal)
+    col_fim = min(col_ini + num_col - 1, jornal["colunas"])
+
+    return {
+        "num_col":     num_col,
+        "cols_exato":  cols_exato,
+        "larg_padrao": larg_padrao,
+        "larg_1col":   lc,
+        "margem":      marg,
+        "desvio":      desvio,
+        "col_ini":     col_ini,
+        "col_fim":     col_fim,
+    }
+
+
 def identificar_formato(w_cm, h_cm, pag_w, pag_h):
     if pag_w <= 0 or pag_h <= 0:
         return "Desconhecido"
@@ -153,7 +211,7 @@ def identificar_formato(w_cm, h_cm, pag_w, pag_h):
             return nome
     return "Faixa"
 
-PT_PARA_CM      = 0.03528
+PT_PARA_CM      = 2.54 / 72   # = 0.03527̄ cm/pt  (1" = 72pt = 2.54cm)
 TAMANHO_PHASH   = 16
 TAMANHO_SSIM    = (256, 256)
 MIN_MATCHES_ORB = 12
@@ -365,8 +423,12 @@ def montar_candidatos(doc):
     return candidatos
 
 
-def buscar_imagem_no_pdf(pdf_path, imagem_busca, funcao_comparacao,
+def buscar_imagem_no_pdf(pdf_path, imagens_busca, funcao_comparacao,
                          limiar, cb_progresso, cb_resultado):
+    """imagens_busca pode ser uma PIL.Image ou lista de PIL.Images."""
+    if not isinstance(imagens_busca, list):
+        imagens_busca = [imagens_busca]
+
     try:
         doc = fitz.open(pdf_path)
     except Exception as e:
@@ -385,10 +447,17 @@ def buscar_imagem_no_pdf(pdf_path, imagem_busca, funcao_comparacao,
     melhor_score = 0.0
 
     for i, cand in enumerate(candidatos):
-        try:
-            score = funcao_comparacao(imagem_busca, cand["imagem"])
-        except Exception:
-            score = 0.0
+        # Score maximo entre todas as imagens de busca
+        score = 0.0
+        img_match = None
+        for img_busca in imagens_busca:
+            try:
+                s = funcao_comparacao(img_busca, cand["imagem"])
+            except Exception:
+                s = 0.0
+            if s > score:
+                score = s
+                img_match = img_busca
 
         if score > melhor_score:
             melhor_score = score
@@ -418,6 +487,7 @@ def buscar_imagem_no_pdf(pdf_path, imagem_busca, funcao_comparacao,
                 "preview": preview,
                 "w_px":    cand["imagem"].width,
                 "h_px":    cand["imagem"].height,
+                "img_match_idx": imagens_busca.index(img_match) + 1 if img_match else 1,
             })
 
         cb_progresso(i + 1, total, cand["pagina"])
@@ -425,72 +495,1563 @@ def buscar_imagem_no_pdf(pdf_path, imagem_busca, funcao_comparacao,
     cb_resultado(matches=matches, melhor_score=melhor_score, total=total, erro=None)
 
 
+def _agrupar_regioes(regioes_pt, tolerancia=8):
+    """Une retangulos proximos iterativamente ate estabilizar.
+    Cada regiao: (x0, y0, x1, y1, meta) onde meta e dict."""
+    grupos = list(regioes_pt)
+    mudou = True
+    while mudou:
+        mudou = False
+        novos = []
+        usado = [False] * len(grupos)
+        for i, g in enumerate(grupos):
+            if usado[i]:
+                continue
+            x0, y0, x1, y1, meta = g
+            usado[i] = True
+            for j in range(i + 1, len(grupos)):
+                if usado[j]:
+                    continue
+                gx0, gy0, gx1, gy1, _ = grupos[j]
+                # Verifica sobreposicao com tolerancia
+                if (gx0 <= x1 + tolerancia and gx1 >= x0 - tolerancia and
+                        gy0 <= y1 + tolerancia and gy1 >= y0 - tolerancia):
+                    x0 = min(x0, gx0); y0 = min(y0, gy0)
+                    x1 = max(x1, gx1); y1 = max(y1, gy1)
+                    usado[j] = True
+                    mudou = True
+            novos.append((x0, y0, x1, y1, meta))
+        grupos = novos
+    return grupos
+
+
 def listar_todos_anuncios(pdf_path, cb_progresso, cb_resultado):
+    """Identifica todos os anuncios de TODAS as paginas do PDF.
+    Combina imagens embutidas e blocos de texto por regiao de pagina,
+    agrupando elementos proximos em um unico anuncio."""
     try:
         doc = fitz.open(pdf_path)
     except Exception as e:
         cb_resultado(erro=str(e))
         return
 
-    candidatos = montar_candidatos(doc)
+    num_paginas = len(doc)
+    candidatos_por_pagina = []  # lista de listas
+
+    for num_pagina in range(num_paginas):
+        pg = num_pagina + 1
+        pagina = doc[num_pagina]
+        pag_w, pag_h = pegar_tamanho_pagina_cm(pagina)
+
+        regioes = []  # (x0_pt, y0_pt, x1_pt, y1_pt, meta)
+
+        # 1) Imagens embutidas
+        for info_img in pagina.get_images(full=True):
+            xref = info_img[0]
+            try:
+                rects = pagina.get_image_rects(xref)
+                if not rects:
+                    continue
+                r = rects[0]
+                if r.width < 10 or r.height < 10:
+                    continue
+                regioes.append((r.x0, r.y0, r.x1, r.y1,
+                                {"fonte": "embutida", "xref": xref}))
+            except Exception:
+                pass
+
+        # 2) Blocos de texto com texto significativo
+        for bloco in pagina.get_text("blocks"):
+            x0, y0, x1, y1, texto = bloco[0], bloco[1], bloco[2], bloco[3], bloco[4]
+            texto = texto.strip()
+            if not texto or len(texto) < 10:
+                continue
+            w_pt = x1 - x0; h_pt = y1 - y0
+            if w_pt < 20 or h_pt < 8:
+                continue
+            # Ignora numeros de pagina isolados
+            if len(texto) <= 4 and texto.isdigit():
+                continue
+            regioes.append((x0, y0, x1, y1, {"fonte": "texto", "texto": texto}))
+
+        if not regioes:
+            candidatos_por_pagina.append([])
+            continue
+
+        # Agrupa regioes proximas em anuncios compostos
+        grupos = _agrupar_regioes(regioes, tolerancia=14)
+
+        # Filtra grupos muito pequenos (menos de ~4 cm2)
+        grupos_validos = []
+        for gx0, gy0, gx1, gy1, meta in grupos:
+            w_cm = pontos_para_cm(gx1 - gx0)
+            h_cm = pontos_para_cm(gy1 - gy0)
+            if w_cm * h_cm < 3.0:
+                continue
+            grupos_validos.append((gx0, gy0, gx1, gy1, meta, w_cm, h_cm, pag_w, pag_h))
+
+        candidatos_por_pagina.append((pg, grupos_validos))
+
     doc.close()
 
+    # Monta lista plana de candidatos
+    candidatos = []
+    for entrada in candidatos_por_pagina:
+        if not entrada:
+            continue
+        pg, grupos_validos = entrada
+        for gx0, gy0, gx1, gy1, meta, w_cm, h_cm, pag_w, pag_h in grupos_validos:
+            candidatos.append({
+                "pagina": pg,
+                "fonte":  meta.get("fonte", "misto"),
+                "imagem": None,
+                "pag_w":  pag_w,
+                "pag_h":  pag_h,
+                "w_cm":   w_cm,
+                "h_cm":   h_cm,
+                "x_cm":   pontos_para_cm(gx0),
+                "y_cm":   pontos_para_cm(gy0),
+                "x0_pt":  gx0, "y0_pt": gy0,
+                "x1_pt":  gx1, "y1_pt": gy1,
+            })
+
     if not candidatos:
-        cb_resultado(erro="Nao foi possivel extrair nenhuma imagem do PDF.")
+        cb_resultado(erro="Nao foi possivel identificar anuncios no PDF.")
         return
 
     total = len(candidatos)
     resultados = []
 
     for i, cand in enumerate(candidatos):
-        thumb = cand["imagem"].copy()
-        thumb.thumbnail((120, 120), Image.LANCZOS)
+        # Extrai imagem embutida real se a regiao tem exatamente uma imagem
+        imagem_real = None
+        try:
+            doc2 = fitz.open(pdf_path)
+            pagina2 = doc2[cand["pagina"] - 1]
+            for info_img in pagina2.get_images(full=True):
+                xref = info_img[0]
+                try:
+                    rects = pagina2.get_image_rects(xref)
+                    if not rects:
+                        continue
+                    r = rects[0]
+                    # Verifica se esta dentro da regiao do grupo
+                    if (r.x0 >= cand["x0_pt"] - 5 and r.y0 >= cand["y0_pt"] - 5 and
+                            r.x1 <= cand["x1_pt"] + 5 and r.y1 <= cand["y1_pt"] + 5):
+                        dados_brutos = doc2.extract_image(xref)
+                        imagem_real = Image.open(
+                            io.BytesIO(dados_brutos["image"])).convert("RGB")
+                        break
+                except Exception:
+                    pass
+            doc2.close()
+        except Exception:
+            pass
 
-        preview = None
-        if cand.get("x_cm") is not None and cand.get("w_cm"):
-            preview = gerar_preview_anuncio(
-                pdf_path, cand["pagina"],
-                cand["x_cm"], cand["y_cm"],
-                cand["w_cm"], cand["h_cm"])
+        thumb = None
+        if imagem_real is not None:
+            thumb = imagem_real.copy()
+            thumb.thumbnail((120, 120), Image.LANCZOS)
 
-        if preview is None:
-            preview = cand["imagem"].copy()
-            preview.thumbnail((200, 400), Image.LANCZOS)
+        preview = gerar_preview_anuncio(
+            pdf_path, cand["pagina"],
+            cand["x_cm"], cand["y_cm"],
+            cand["w_cm"], cand["h_cm"])
+
+        if preview is None and imagem_real is not None:
+            preview = imagem_real.copy()
+            preview.thumbnail((300, 500), Image.LANCZOS)
+
+        if thumb is None and preview is not None:
+            thumb = preview.copy()
+            thumb.thumbnail((120, 120), Image.LANCZOS)
 
         resultados.append({
             **cand,
             "numero":  i + 1,
             "thumb":   thumb,
             "preview": preview,
-            "w_px":    cand["imagem"].width,
-            "h_px":    cand["imagem"].height,
+            "w_px":    imagem_real.width  if imagem_real else 0,
+            "h_px":    imagem_real.height if imagem_real else 0,
+            "autor_info": extrair_autor_de_regiao(
+                pdf_path, cand["pagina"],
+                cand["x0_pt"], cand["y0_pt"],
+                cand["x1_pt"], cand["y1_pt"]),
         })
         cb_progresso(i + 1, total, cand["pagina"])
 
     cb_resultado(imagens=resultados, total=total, erro=None)
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  EXTRAÇÃO DE AUTOR / COLABORADOR DE MATÉRIAS JORNALÍSTICAS
+# ═══════════════════════════════════════════════════════════════════
 
-import unicodedata
-import re as _re
+import re as _re_autor
+import unicodedata as _uc_autor
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MÓDULO DE EXTRAÇÃO DE AUTOR — v4 (arquitetura modular + híbrida)
+#
+#  Pipeline de 6 etapas:
+#    1. Pré-processamento      → linhas limpas
+#    2. Localização do título  → título + posição
+#    3. Delimitação do corpo   → início e fim do corpo
+#    4. Extração de candidatos → zonas "antes" E "depois" do corpo
+#    5. Pontuação + NER        → heurísticas + spaCy
+#    6. Normalização + saída   → resultado estruturado
+#
+#  Funções públicas:
+#    extrair_autores_completo(texto) → dict com título + lista de autores
+#    extrair_autor(texto)            → dict compat. com versão anterior
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CONFIGURAÇÃO — pesos e regras centralizados e ajustáveis
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AutorConfig:
+    """Configuração centralizada do extrator de autores.
+
+    Ajuste os atributos desta classe para calibrar o comportamento
+    sem precisar alterar a lógica central.
+    """
+
+    # ── Pesos positivos ────────────────────────────────────────────────────
+    SCORE_NOME_PROPRIO  = 4   # is_human_name(): 2-5 palavras, iniciais maiúsculas
+    SCORE_CAPS          = 2   # linha toda em MAIÚSCULAS (byline clássico de jornal)
+    SCORE_TITLE_CASE    = 3   # Title Case sem CAPS (Marta Rodrigues)
+    SCORE_LINHA_CURTA   = 2   # 2–4 palavras → bylines são concisos
+    SCORE_ISOLADA       = 2   # linha curta entre linhas longas (isolação visual)
+    SCORE_PERTO_TITULO  = 4   # próximo ao título detectado (posição de byline)
+    SCORE_NER_PESSOA    = 3   # NER reforça PERSON — bônus, nunca veto
+    SCORE_REDACAO       = 5   # contém "DA REDAÇÃO"
+    SCORE_ASTERISCO     = 3   # asterisco de byline editorial (* antes/depois)
+    SCORE_APOS_TEXTO    = 2   # zona após o corpo (assinatura de artigo)
+    SCORE_DESC_CARGO    = 3   # padrão "Nome\nCargo" → próxima linha é cargo
+
+    # ── Penalidades (reduzem o score; não vetam sozinhas) ─────────────────
+    PENALTY_LONGA           = -3   # linha > 50 chars → bylines são curtos
+    PENALTY_SECAO_PROXIMA   = -2   # próxima linha é seção → provável dateline
+    PENALTY_PONTUACAO_FINAL = -2   # termina com . ou , → frase normal
+
+    # ── Threshold e janelas ────────────────────────────────────────────────
+    THRESHOLD           = 4    # score mínimo para aceitar candidato
+    JANELA_ANTES        = 10   # linhas antes do corpo a escanear
+    JANELA_DEPOIS       = 8    # linhas após o corpo a escanear
+    DISTANCIA_TITULO    = 5    # dist. máx. (linhas) do título para bônus
+
+    # ── Comprimento máximo de uma linha de autor (chars) ──────────────
+    MAX_LEN_AUTOR       = 80
+
+    # ── Padrões de "DA REDAÇÃO" (sem acento, uppercase) ───────────────
+    PADROES_REDACAO     = ["DA REDACAO", "DA REDAÇAO"]
+
+    # ── Regex de colaboração ("COM Fulano e Ciclano") ─────────────────
+    PADRAO_COLABORACAO  = r'\bCOM\b\s+(.+)'
+
+    # ── Indicadores de cargo/função (usados em _is_description_line) ──
+    INDICADORES_CARGO   = [
+        "jornalista", "reporter", "repórter", "colunista",
+        "articulista", "presidente", "diretor", "diretora",
+        "vereador", "vereadora", "deputad", "senador", "senadora",
+        "professor", "professora", "advogad", "médic", "medic",
+        "escritor", "escritora", "especialista", "analista",
+        "secretári", "secretari", "administrad", "economista",
+        "sociólog", "sociolog", "historiador", "filósof", "filosof",
+        "psicólog", "psicolog", "editor", "editora",
+        "correspondente", "enviado especial", "colaborador",
+        "colaboradora", "especial para", "é jornalista",
+    ]
+
+
+# Instância padrão (usada quando nenhuma config é passada)
+_cfg_padrao = AutorConfig()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  NER (spaCy) — carregamento lazy
+# ──────────────────────────────────────────────────────────────────────────────
+
+_nlp_ner = None
+_nlp_ner_disponivel = None
+
+
+def _carregar_ner():
+    """Carrega o modelo spaCy (lazy, uma única vez)."""
+    global _nlp_ner, _nlp_ner_disponivel
+    if _nlp_ner_disponivel is not None:
+        return _nlp_ner_disponivel
+    try:
+        import spacy
+        for modelo in ("pt_core_news_lg", "pt_core_news_sm"):
+            try:
+                _nlp_ner = spacy.load(modelo)
+                _nlp_ner_disponivel = True
+                return True
+            except OSError:
+                continue
+        _nlp_ner_disponivel = False
+    except ImportError:
+        _nlp_ner_disponivel = False
+    return _nlp_ner_disponivel
+
+
+def is_person_name_ner(text):
+    """NER desativado — retorna None (sem dependência externa)."""
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LISTAS DE REJEIÇÃO
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SECOES_PROIBIDAS = frozenset({
+    "SALVADOR", "OPINIÃO", "OPINIAO", "BAHIA", "BRASIL", "MUNDO",
+    "ESPORTES", "ESPORTE", "ECONOMIA", "CULTURA", "POLITICA", "POLÍTICA",
+    "CLASSIFICADOS", "CADERNO", "CIDADES", "EDITORIAL", "OBITUÁRIO",
+    "OBITUARIO", "POLICIA", "POLÍCIA", "SAÚDE", "SAUDE", "EDUCAÇÃO",
+    "EDUCACAO", "TODOS", "FOTO", "FOTOS", "INFOGRÁFICO", "INFOGRAFICO",
+    "PÁGINA", "PAGINA", "PUBLICIDADE", "ANÚNCIO", "ANUNCIO",
+    "COTIDIANO", "LAZER", "VARIEDADES", "ESPECIAL", "NACIONAL","SALVADOR",
+    "INTERNACIONAL", "TECNOLOGIA", "CIÊNCIA", "CIENCIA", "MEIO AMBIENTE",
+})
+
+_BLACKLIST_NOMES = frozenset({
+    "CLUBE", "BAHIA", "ENSINO", "SUPERIOR", "NÚCLEO", "NUCLEO",
+    "IMPRESSOS", "DIGITAL", "SECRETARIA", "PREFEITURA", "UNIVERSIDADE",
+    "FACULDADE", "HOSPITAL", "CENTRO", "PROGRAMA", "PROJETO",
+    "GOVERNO", "MINISTÉRIO", "MINISTERIO", "CONSELHO", "EMPRESA",
+    "AGÊNCIA", "AGENCIA", "ASSOCIAÇÃO", "ASSOCIACAO",
+    "ESPORTE", "ESPORTES", "SISTEMA", "PLANO", "INSTITUTO",
+    "FUNDAÇÃO", "FUNDACAO", "COMISSÃO", "COMISSAO", "TRIBUNAL",
+    "CÂMARA", "CAMARA", "ASSEMBLEIA", "ASSEMBLEIA", "FEDERAÇÃO",
+    "FEDERACAO", "SINDICATO", "COOPERATIVA", "COMPANHIA",
+    "DEPARTAMENTO", "DIRETORIA", "GERÊNCIA", "GERENCIA",
+    "COORDENAÇÃO", "COORDENACAO", "SUPERINTENDÊNCIA", "SUPERINTENDENCIA",
+    "EDITORIA", "COLUNA", "SEÇÃO", "SECAO", "SUPLEMENTO",
+    "CADERNO", "JORNAL", "REVISTA", "GAZETA", "CORREIO",
+    "GRUPO", "REDE", "ORGANIZAÇÃO", "ORGANIZACAO",
+    "LTDA", "S/A", "EIRELI", "MEI", "CNPJ",
+})
+
+_PALAVRAS_NAO_NOME = frozenset({
+    "CLUBE", "ENSINO", "SUPERIOR", "DIGITAL", "SISTEMA", "PLANO",
+    "ESPORTE", "RESULTADO", "RELATÓRIO", "RELATORIO", "PROCESSO",
+    "SERVIÇO", "SERVICO", "PRODUTO", "MERCADO", "VENDA", "COMPRA",
+    "OFERTA", "DEMANDA", "VALOR", "PREÇO", "PRECO", "CUSTO",
+    "TAXA", "ÍNDICE", "INDICE", "NÚMERO", "NUMERO", "TOTAL",
+    "PARCIAL", "FINAL", "INICIAL", "GERAL", "LOCAL", "REGIONAL",
+    "ESTADUAL", "FEDERAL", "MUNICIPAL", "PÚBLICO", "PUBLICO",
+    "PRIVADO", "SOCIAL", "CIVIL", "MILITAR", "URBANO", "RURAL",
+    "NOVO", "NOVA", "ANTIGO", "ANTIGA", "GRANDE", "PEQUENO",
+    "ALTO", "BAIXO", "BOM", "MAU", "PRIMEIRO", "SEGUNDO",
+    "TERCEIRO", "QUARTO", "ÚLTIMO", "ULTIMO",
+})
+
+_PREPOSICOES_NOME = frozenset({"DE", "DA", "DO", "DOS", "DAS", "E"})
+
+_VERBOS_COMUNS = frozenset({
+    "É", "FOI", "SÃO", "SAO", "TEM", "VAI", "VEM", "FAZ", "DIZ",
+    "DEU", "DEZ", "FEZ", "VER", "SER", "TER", "PODE", "DEVE",
+    "QUER", "SERÁ", "SERA", "ESTÁ", "ESTA", "ESTÃO", "ESTAO",
+    "SOBRE", "CONTRA", "PARA", "COMO", "MAIS", "APÓS", "APOS",
+    "ANTES", "ENTRE", "AINDA", "TAMBÉM", "TAMBEM", "ONDE",
+    "PORQUE", "QUANDO", "QUAL", "QUAIS",
+})
+
+
+def _remover_acentos(texto):
+    nfkd = _uc_autor.normalize("NFD", texto)
+    return "".join(c for c in nfkd if _uc_autor.category(c) != "Mn")
+
+
+def _palavra_so_letras(palavra):
+    """Retorna True se a palavra contém apenas letras (incluindo acentuadas)."""
+    return all(c.isalpha() for c in palavra)
+
+
+def _normalizar_nome(nome):
+    """Normaliza capitalização e extrai primeiro + último nome quando há mais de 2.
+
+    Regras:
+    - JACKSON SOUZA          → Jackson Souza
+    - João Carlos da Silva   → João Silva  (primeiro + último; partículas descartadas)
+    - Marta Rodrigues        → Marta Rodrigues  (inalterado)
+    - Jackson de Souza       → Jackson Souza  (preposição descartada)
+    """
+    nome = nome.strip().strip("*").strip()
+    if not nome:
+        return nome
+
+    # Passo 1: normaliza capitalização
+    partes = []
+    for p in nome.split():
+        if p.upper() in _PREPOSICOES_NOME:
+            # mantém minúsculo (da / de / do)
+            partes.append(p.lower())
+        elif p == p.upper():
+            # tudo maiúsculo → capitaliza
+            partes.append(p.capitalize())
+        else:
+            partes.append(p)
+
+    # Passo 2: se mais de 2 palavras, reduz a Primeiro + Último (ignora partículas)
+    _PREP = {"de", "da", "do", "dos", "das", "e"}
+    significativas = [p for p in partes if p.lower() not in _PREP]
+    if len(significativas) > 2:
+        partes = [significativas[0], significativas[-1]]
+    elif len(significativas) == 2 and len(partes) > 2:
+        # Ex: "Jackson de Souza" → ["Jackson", "de", "Souza"] → drop "de"
+        partes = significativas
+
+    return " ".join(partes)
+
+
+# Regex determinista de nome de pessoa: cada palavra começa com maiúscula +
+# minúsculas, separadas por espaço.  Aceita até 4 palavras (inclui partícula).
+# Ex: "Jackson Souza" ✔  "João da Silva" ✔  "JACKSON SOUZA" ✘  "Economia" ✘
+_RE_NOME_PROPRIO = _re_autor.compile(
+    r'^'
+    r'[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+'           # primeira palavra: Mai+min
+    r'(?:'                                  # grupo repetível (1-4 vezes):
+        r'\s(?:de|da|do|dos|das|e)'         #   partícula sem capitalização
+        r'|'
+        r'\s[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ]+'      #   palavra com Mai+min
+    r'){1,4}'                               # até 4 partes adicionais (suporta até 5 tokens)
+    r'$'
+)
+
+
+def is_valid_person_name(text: str) -> bool:
+    """Validação determinista de nome de pessoa. Sem IA, apenas regex + regras.
+
+    Critérios obrigatórios (todos devem passar):
+    1. 2–4 palavras totais (preposicões contam)
+    2. Cada palavra significativa: inicial maiúscula + restante minúsculo
+    3. Sem dígitos, sem pontuação fora do nome, sem @
+    4. Nenhuma palavra na blocklist institucional ou de seção
+    5. Nenhum verbo comum
+    6. Linha não é inteiramente em CAPS (não-normalizada) → já deve ter passado
+       por _normalizar_nome antes de ser testada
+    """
+    if not text:
+        return False
+    t = text.strip().strip("*").strip()
+    if not t or len(t) > 80:
+        return False
+    # Sem dígitos
+    if any(c.isdigit() for c in t):
+        return False
+    # Sem pontuação forte ou arroba (endereços de e-mail não são nomes)
+    if _re_autor.search(r'[.:;!?()\[\]{}"\'/\\@#$%&+=<>,]', t):
+        return False
+    palavras = t.split()
+    if len(palavras) < 2 or len(palavras) > 4:
+        return False
+    # Valida estrutura com a regex principal
+    if not _RE_NOME_PROPRIO.match(t):
+        return False
+    # Blocklist: nenhuma palavra pode ser institucional ou de seção
+    t_upper = _remover_acentos(t.upper())
+    for bl in _BLACKLIST_NOMES:
+        if _re_autor.search(r'\b' + _re_autor.escape(bl) + r'\b', t_upper):
+            return False
+    if t_upper in _SECOES_PROIBIDAS:
+        return False
+    for p in palavras:
+        pu = _remover_acentos(p.upper())
+        if pu in _PALAVRAS_NAO_NOME:
+            return False
+        if pu in _VERBOS_COMUNS:
+            return False
+    # Não pode ser "DA REDAÇÃO"
+    if "REDACAO" in _remover_acentos(t.upper()):
+        return False
+    return True
+
+
+# Mantém o nome antigo como alias para não quebrar chamadas externas
+is_human_name = is_valid_person_name
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  FUNÇÕES AUXILIARES
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _linha_tem_data(linha):
+    """Detecta se a linha contém uma data."""
+    return bool(_re_autor.search(
+        r'\b\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}\b|\b\d{1,2}\s+de\s+\w+\b',
+        linha, _re_autor.IGNORECASE))
+
+
+def _linha_tem_numeros_precos(linha):
+    """Detecta se a linha contém números, preços ou localizações."""
+    return bool(
+        _re_autor.search(r'R\$\s*[\d.,]+', linha) or
+        _re_autor.search(r'\b\d{3,}\b', linha) or
+        _re_autor.search(r'\b\d+[.,]\d+\b', linha)
+    )
+
+
+def _is_description_line(linha, config=None):
+    """Linha parece descrição de cargo ou função."""
+    cfg = config or _cfg_padrao
+    linha = linha.strip()
+    if not linha or len(linha.split()) < 2 or len(linha) > 120:
+        return False
+    if linha == linha.upper() and len(linha.split()) <= 5:
+        return False
+    return any(ind in linha.lower() for ind in cfg.INDICADORES_CARGO)
+
+
+def _extrair_colaboradores(linha, config=None):
+    """Extrai nomes de colaboradores de 'DA REDAÇÃO, COM NOME1 E NOME2'."""
+    cfg = config or _cfg_padrao
+    colaboradores = []
+    match = _re_autor.search(cfg.PADRAO_COLABORACAO, linha, _re_autor.IGNORECASE)
+    if not match:
+        return colaboradores
+    trecho = match.group(1).strip().rstrip(".")
+    for parte in _re_autor.split(r'\s+E\s+|,\s*', trecho):
+        parte = parte.strip()
+        if not parte:
+            continue
+        # Normaliza CAPS para TitleCase antes de validar
+        if parte == parte.upper():
+            parte = parte.title()
+        if is_human_name(parte):
+            colaboradores.append(_normalizar_nome(parte))
+    return colaboradores
+
+
+def _dividir_multiplos_nomes(linha):
+    """Tenta dividir uma linha com múltiplos nomes em partes individuais.
+
+    Ex: "PAULO LEANDRO E MIRIAM HERMES" → ["PAULO LEANDRO", "MIRIAM HERMES"]
+    Só divide quando TODOS os fragmentos passam em is_human_name(), evitando
+    quebrar linhas de corpo de texto comuns.
+    Retorna lista com a linha original se não conseguir dividir com segurança.
+    """
+    limpa = linha.strip()
+    # Divide por " E " (maiúsculo/minúsculo) ou ", "
+    partes = _re_autor.split(r'\s+[Ee]\s+|,\s+', limpa)
+    if len(partes) <= 1:
+        return [limpa]
+    partes = [p.strip() for p in partes if p.strip()]
+    # Só aceita a divisão se cada fragmento parecer um nome humano
+    if len(partes) >= 2 and all(is_human_name(p) for p in partes):
+        return partes
+    return [limpa]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ETAPA 1 — PRÉ-PROCESSAMENTO
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _preprocessar_linhas(texto):
+    """Normaliza e divide o texto em linhas não-vazias."""
+    linhas = []
+    for l in texto.splitlines():
+        l_strip = " ".join(l.split())
+        if l_strip:
+            linhas.append(l_strip)
+    return linhas
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ETAPA 2 — LOCALIZAÇÃO DO TÍTULO
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extrair_titulo(linhas, max_pos=8):
+    """Detecta o título da matéria e sua posição.
+
+    Título típico: primeira linha proeminente com 2–15 palavras antes do corpo.
+    """
+    for i, l in enumerate(linhas[:max_pos]):
+        l_strip = l.strip()
+        palavras = l_strip.split()
+        # Títulos têm pelo menos 3 palavras (nomes próprios têm 2 → ignorar)
+        if len(palavras) < 3 or len(palavras) > 15:
+            continue
+        if len(l_strip) < 8 or len(l_strip) > 150:
+            continue
+        if not l_strip[0].isupper():
+            continue
+        # Seção de 1–3 palavras todo maiúsculo → não é título
+        if l_strip == l_strip.upper() and len(palavras) <= 3:
+            continue
+        # Não é linha de cargo/função
+        if _is_description_line(l_strip):
+            continue
+        # Não é DA REDAÇÃO
+        if any(p in _remover_acentos(l_strip.upper()) for p in ["DA REDACAO", "REDACAO"]):
+            continue
+        if _linha_tem_data(l_strip):
+            continue
+        return l_strip, i
+    return None, -1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ETAPA 3 — DELIMITAÇÃO DO CORPO
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _encontrar_inicio_corpo(linhas):
+    """Índice da primeira linha de parágrafo do corpo."""
+    for i, linha in enumerate(linhas):
+        l = linha.strip()
+        if not l:
+            continue
+        if len(l) > 60 or (len(l) > 20 and l.endswith(".")):
+            return i
+    return len(linhas)
+
+
+def _encontrar_fim_corpo(linhas, inicio_corpo):
+    """Índice logo após a última linha longa do corpo."""
+    for i in range(len(linhas) - 1, inicio_corpo - 1, -1):
+        if len(linhas[i].strip()) > 40:
+            return i + 1
+    return len(linhas)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ETAPA 4 — EXTRAÇÃO DE CANDIDATOS (zonas antes e depois)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _candidatos_antes(linhas, inicio_corpo, config):
+    ini = max(0, inicio_corpo - config.JANELA_ANTES)
+    return [{"linha": linhas[i], "indice": i, "zona": "antes"}
+            for i in range(ini, inicio_corpo)]
+
+
+def _candidatos_depois(linhas, fim_corpo, config):
+    fim = min(len(linhas), fim_corpo + config.JANELA_DEPOIS)
+    return [{"linha": linhas[i], "indice": i, "zona": "depois"}
+            for i in range(fim_corpo, fim)]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ETAPA 5 — PONTUAÇÃO DE CANDIDATOS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _classificar_candidato(cand, linhas, titulo_idx, config):
+    """Classifica se uma linha candidata é autor com score balanceado.
+
+    Arquitetura em duas fases:
+
+    FASE A — Desqualificação imediata (-999)
+        Rejeita casos que nunca poderão ser nomes de autores, independente
+        de qualquer contexto. Sem exceções.
+
+    FASE B — Pontuação balanceada
+        Calcula score somando sinais POSITIVOS e PENALIDADES.
+        Aceito apenas se score >= config.THRESHOLD.
+        Isso permite que um nome em contexto fraco ainda seja aceito
+        se tiver múltiplos sinais positivos, e rejeita linhas suspeitas
+        mesmo que passem na Fase A.
+
+    Retorna (score: int, motivos: list[str]).
+    score == -999 → descartado na Fase A.
+    """
+    linha = cand["linha"]
+    idx   = cand["indice"]
+    zona  = cand["zona"]
+
+    linha_s       = linha.strip()
+    has_asterisco = linha_s.startswith("*") or linha_s.endswith("*")
+    limpa         = linha_s.strip("*").strip()
+    limpa_upper   = _remover_acentos(limpa.upper())
+    palavras      = limpa.split()
+    n_palavras    = len(palavras)
+
+    # Contexto: linhas vizinhas (string vazia se inexistente)
+    ant  = linhas[idx - 1].strip() if idx > 0 else ""
+    prox = linhas[idx + 1].strip() if idx + 1 < len(linhas) else ""
+
+    # ════════════════════════════════════════════════════════════════════
+    # FASE A — DESQUALIFICAÇÃO IMEDIATA
+    # Estes casos são estruturalmente impossíveis de ser nomes de autores.
+    # ════════════════════════════════════════════════════════════════════
+
+    if not limpa:
+        return -999, ["vazio"]
+
+    # Linha absurdamente longa → nenhum byline ultrapassa MAX_LEN_AUTOR chars
+    if len(limpa) > config.MAX_LEN_AUTOR:
+        return -999, ["muito_longa"]
+
+    # Seção jornalística / dateline de cidade (match exato)
+    if limpa_upper in _SECOES_PROIBIDAS:
+        return -999, ["secao_proibida"]
+
+    # Linha que **começa** com seção/cidade mas tem sufixo (ex: "SALVADOR —",
+    # "BAHIA, 15/03"). Só rejeita se não for um nome humano válido
+    # (evita rejeitar "Salvador Nascimento" ou "Bahia Santos").
+    primeiro_upper = _remover_acentos(palavras[0].upper()) if palavras else ""
+    if primeiro_upper in _SECOES_PROIBIDAS and not is_human_name(limpa):
+        return -999, [f"inicio_secao:{primeiro_upper}"]
+
+    # Palavra institucional (busca por palavra inteira com \b)
+    for bl in _BLACKLIST_NOMES:
+        if _re_autor.search(r'\b' + _re_autor.escape(bl) + r'\b', limpa_upper):
+            return -999, [f"blacklist:{bl}"]
+
+    # A linha É o próprio título → o título não é o autor
+    if idx == titulo_idx:
+        return -999, ["eh_titulo"]
+
+    # Contém data → é dateline, não byline
+    if _linha_tem_data(linha):
+        return -999, ["data"]
+
+    # Contém números ou preços → não é nome
+    if _linha_tem_numeros_precos(linha):
+        return -999, ["numeros_precos"]
+
+    # A linha EM SI é um cargo/função (ex: "Vereadora de Salvador").
+    # O cargo aparece ABAIXO do nome; a linha de cargo nunca é o autor.
+    if _is_description_line(linha, config):
+        return -999, ["eh_cargo"]
+
+    # ════════════════════════════════════════════════════════════════════
+    # FASE B — PONTUAÇÃO BALANCEADA
+    # Sinais positivos aumentam a confiança; penalidades diminuem.
+    # Candidato aceito somente se score final >= config.THRESHOLD.
+    # ════════════════════════════════════════════════════════════════════
+    score  = 0
+    motivos = []
+
+    # ── Sinais positivos ───────────────────────────────────────────────
+
+    # [+4] Heurística determinista de nome de pessoa (regex + blocklist)
+    nome_valido = is_valid_person_name(_normalizar_nome(limpa))
+    if nome_valido:
+        score += config.SCORE_NOME_PROPRIO
+        motivos.append(f"+{config.SCORE_NOME_PROPRIO}:nome_proprio")
+
+    # [+2] Todo em CAPS e composto só de letras (byline clássico de jornal)
+    is_upper = (limpa == limpa.upper() and n_palavras >= 2
+                and all(p.isalpha() for p in palavras))
+    if is_upper:
+        score += config.SCORE_CAPS
+        motivos.append(f"+{config.SCORE_CAPS}:CAPS")
+
+    # [+3] Title Case: iniciais maiúsculas mas não tudo caps (Marta Rodrigues)
+    if (not is_upper) and nome_valido:
+        score += config.SCORE_TITLE_CASE
+        motivos.append(f"+{config.SCORE_TITLE_CASE}:title_case")
+
+    # [+2] Linha curta: bylines têm tipicamente 2–4 palavras
+    if 2 <= n_palavras <= 4:
+        score += config.SCORE_LINHA_CURTA
+        motivos.append(f"+{config.SCORE_LINHA_CURTA}:linha_curta")
+
+    # [+4] Próximo ao título detectado (posição característica de byline)
+    if titulo_idx >= 0 and abs(idx - titulo_idx) <= config.DISTANCIA_TITULO:
+        score += config.SCORE_PERTO_TITULO
+        motivos.append(f"+{config.SCORE_PERTO_TITULO}:perto_titulo")
+
+    # [+2] Linha isolada entre linhas longas (padrão visual de byline)
+    if len(limpa) < 50 and (len(ant) > 55 or len(prox) > 55):
+        score += config.SCORE_ISOLADA
+        motivos.append(f"+{config.SCORE_ISOLADA}:isolada")
+
+    # [+3] Padrão "Nome\nCargo": linha seguinte é descrição de cargo
+    if _is_description_line(prox, config):
+        score += config.SCORE_DESC_CARGO
+        motivos.append(f"+{config.SCORE_DESC_CARGO}:seguido_de_cargo")
+
+    # [+2] Assinatura no final do texto (artigos de opinião)
+    if zona == "depois":
+        score += config.SCORE_APOS_TEXTO
+        motivos.append(f"+{config.SCORE_APOS_TEXTO}:zona_depois")
+
+    # [+3] Asterisco editorial (* antes ou depois) — marcador explícito de byline
+    if has_asterisco:
+        score += config.SCORE_ASTERISCO
+        motivos.append(f"+{config.SCORE_ASTERISCO}:asterisco")
+
+    # NER removido: sistema é 100% determinístico
+
+    # ── Penalidades ────────────────────────────────────────────────────
+
+    # [-3] Linha longa para um byline (50–80 chars) → provavelmente frase
+    if len(limpa) > 50:
+        score += config.PENALTY_LONGA
+        motivos.append(f"{config.PENALTY_LONGA}:linha_longa")
+
+    # [-2] Próxima linha é seção proibida → atual provavelmente é dateline
+    if _remover_acentos(prox.upper()) in _SECOES_PROIBIDAS:
+        score += config.PENALTY_SECAO_PROXIMA
+        motivos.append(f"{config.PENALTY_SECAO_PROXIMA}:precede_secao")
+
+    # [-2] Termina com ponto ou vírgula → frase normal, não byline
+    if limpa.endswith(".") or limpa.endswith(","):
+        score += config.PENALTY_PONTUACAO_FINAL
+        motivos.append(f"{config.PENALTY_PONTUACAO_FINAL}:termina_pontuacao")
+
+    return score, motivos
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  FUNÇÃO PRINCIPAL — extrair_autores_completo
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extrair_autores_completo(texto, config=None, debug=False):
+    """Extrai autores de um bloco de texto jornalístico.
+
+    Escaneia antes E depois do corpo para cobrir bylines e assinaturas.
+
+    Retorna dict:
+        titulo       : str | None      — título detectado
+        autores      : list[str]       — nomes normalizados de todos os autores
+        tipo         : str             — tipo dominante (reporter/redacao/articulista)
+        colaboradores: list[str]       — nomes de colaboradores (COM ...)
+        confianca    : float           — 0.0 – 1.0
+        raw_linhas   : list[str]       — linhas originais detectadas
+        log          : list[str]       — log de decisões (se debug=True)
+    """
+    cfg = config or _cfg_padrao
+    log = []
+
+    def _log(msg):
+        if debug:
+            log.append(msg)
+
+    resultado_vazio = {
+        "titulo": None, "autores": [], "tipo": "desconhecido",
+        "colaboradores": [], "confianca": 0.0, "raw_linhas": [], "log": log,
+    }
+
+    if not texto or not texto.strip():
+        return resultado_vazio
+
+    # ── Etapa 1: Pré-processamento ───────────────────────────────
+    linhas = _preprocessar_linhas(texto)
+    if not linhas:
+        return resultado_vazio
+    _log(f"[PRE] {len(linhas)} linhas")
+
+    # ── Etapa 2: Localização do título ───────────────────────────
+    titulo, titulo_idx = _extrair_titulo(linhas)
+    _log(f"[TITULO] '{titulo}' @ idx={titulo_idx}")
+
+    # ── Etapa 3: Delimitação do corpo ────────────────────────────
+    inicio_corpo = _encontrar_inicio_corpo(linhas)
+    fim_corpo    = _encontrar_fim_corpo(linhas, inicio_corpo)
+    _log(f"[CORPO] início={inicio_corpo}  fim={fim_corpo}")
+
+    # ── Detecção imediata de "DA REDAÇÃO" nas zonas candidatas ───
+    zonas_check = list(range(max(0, inicio_corpo - cfg.JANELA_ANTES), inicio_corpo))
+    zonas_check += list(range(fim_corpo, min(len(linhas), fim_corpo + cfg.JANELA_DEPOIS)))
+    for i in zonas_check:
+        linha = linhas[i]
+        lu = _remover_acentos(linha.upper())
+        for padrao in cfg.PADROES_REDACAO:
+            if padrao in lu:
+                colaboradores = _extrair_colaboradores(linha, cfg)
+                _log(f"[REDACAO] '{linha}'  colab={colaboradores}")
+                # Inclui colaboradores em autores:
+                # "DA REDAÇÃO, COM PAULO E MIRIAM" → autores=[Redação, Paulo, Miriam]
+                autores_redacao = ["Redação"] + colaboradores
+                return {
+                    "titulo": titulo,
+                    "autores": autores_redacao,
+                    "tipo": "redacao",
+                    "colaboradores": colaboradores,
+                    "confianca": 0.95 if colaboradores else 0.90,
+                    "raw_linhas": [linha],
+                    "log": log,
+                }
+
+    # ── Etapa 4: Candidatos nas duas zonas ───────────────────────
+    todos_cands = (
+        _candidatos_antes(linhas, inicio_corpo, cfg) +
+        _candidatos_depois(linhas, fim_corpo, cfg)
+    )
+    _log(f"[CANDS] total={len(todos_cands)}")
+
+    # ── Etapa 5: Classificação (score balanceado) ────────────────────────
+    scored = []
+    for cand in todos_cands:
+        score, motivos = _classificar_candidato(cand, linhas, titulo_idx, cfg)
+        if score == -999:
+            _log(f"[FASE-A] rejeitado '{cand['linha']}'  ← {motivos[0] if motivos else '?'}")
+            continue
+        _log(f"[SCORE={score:+d}] '{cand['linha']}'  → {motivos}")
+        scored.append((score, cand, motivos))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    aceitos = [(s, c, m) for s, c, m in scored if s >= cfg.THRESHOLD]
+
+    if not aceitos:
+        _log(f"[RESULTADO] nenhum candidato alcançou threshold={cfg.THRESHOLD}")
+        if debug:
+            for s, c, m in scored[:3]:
+                _log(f"  top_descartado score={s:+d}: '{c['linha']}'  {m}")
+        return resultado_vazio
+
+    # ── Etapa 6: Montar resultado (deduplicar por proximidade) ───
+    autores_aceitos = []
+    ultimos_idx = []
+    for score, cand, motivos in aceitos:
+        if any(abs(cand["indice"] - ui) < 2 for ui in ultimos_idx):
+            continue
+        autores_aceitos.append((score, cand))
+        ultimos_idx.append(cand["indice"])
+
+    autores_nomes  = []
+    raw_linhas     = []
+    tipos          = []
+    confiancas     = []
+
+    for score, cand in autores_aceitos:
+        linha_s_c = cand["linha"].strip()
+        tem_ast   = linha_s_c.startswith("*") or linha_s_c.endswith("*")
+        limpa_raw = linha_s_c.strip("*").strip()
+        prox      = linhas[cand["indice"] + 1] if cand["indice"] + 1 < len(linhas) else ""
+
+        # Determina tipo do autor para este candidato
+        if tem_ast:
+            tipo_cand = "reporter"      # asterisco = byline editorial explícito
+        elif cand["zona"] == "depois" or _is_description_line(prox, cfg):
+            tipo_cand = "articulista"   # assinatura ao final ou seguida de cargo
+        else:
+            tipo_cand = "reporter"
+
+        confianca_cand = min(0.95, 0.45 + score * 0.05)
+
+        # Separa múltiplos nomes em uma linha: "FULANO E BELTRANO" → nomes individuais
+        # Só divide quando ambas as partes passam em is_human_name() — sem falsos positivos
+        partes_nome = _dividir_multiplos_nomes(limpa_raw)
+        for parte in partes_nome:
+            autores_nomes.append(_normalizar_nome(parte))
+            raw_linhas.append(cand["linha"])
+            tipos.append(tipo_cand)
+            confiancas.append(confianca_cand)
+
+    # ── Deduplicação final por nome normalizado ───────────────────────
+    # Remove repetições causadas por candidatos de zonas sobrepostas
+    vistos        = set()
+    autores_nomes_d  = []
+    raw_linhas_d     = []
+    tipos_d          = []
+    confiancas_d     = []
+    for n, r, t, c in zip(autores_nomes, raw_linhas, tipos, confiancas):
+        chave = _remover_acentos(n.upper())
+        if chave not in vistos:
+            vistos.add(chave)
+            autores_nomes_d.append(n)
+            raw_linhas_d.append(r)
+            tipos_d.append(t)
+            confiancas_d.append(c)
+    autores_nomes = autores_nomes_d
+    raw_linhas    = raw_linhas_d
+    tipos         = tipos_d
+    confiancas    = confiancas_d
+
+    tipo_dominante = max(set(tipos), key=tipos.count) if tipos else "desconhecido"
+    confianca_max  = max(confiancas) if confiancas else 0.0
+
+    _log(f"[FINAL] autores={autores_nomes}  tipo={tipo_dominante}  confianca={confianca_max:.2f}")
+
+    return {
+        "titulo":        titulo,
+        "autores":       autores_nomes,
+        "tipo":          tipo_dominante,
+        "colaboradores": [],
+        "confianca":     confianca_max,
+        "raw_linhas":    raw_linhas,
+        "log":           log,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  WRAPPER BACKWARD-COMPATIBLE — extrair_autor
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extrair_autor(texto, debug=False):
+    """Wrapper retrocompatível que chama extrair_autores_completo().
+
+    Retorna dict:
+        autor:            str | None
+        tipo:             'reporter' | 'redacao' | 'articulista' | 'desconhecido'
+        colaboradores:    list[str]
+        raw_autor_linha:  str
+        confianca:        float
+        log:              list[str]
+    """
+    r = extrair_autores_completo(texto, debug=debug)
+    return {
+        "autor":           r["autores"][0] if r["autores"] else None,
+        "tipo":            r["tipo"],
+        "colaboradores":   r["colaboradores"],
+        "raw_autor_linha": r["raw_linhas"][0] if r["raw_linhas"] else "",
+        "confianca":       r["confianca"],
+        "log":             r["log"],
+    }
+
+
+def extrair_autor_de_regiao(pdf_path, num_pagina, x0_pt, y0_pt, x1_pt, y1_pt):
+    """Extrai texto de uma região do PDF e tenta identificar o autor."""
+    try:
+        doc = fitz.open(pdf_path)
+        pagina = doc[num_pagina - 1]
+        rect = fitz.Rect(x0_pt, y0_pt, x1_pt, y1_pt)
+        texto = pagina.get_text("text", clip=rect)
+        doc.close()
+        return extrair_autor(texto)
+    except Exception:
+        return extrair_autor("")
+
+
+def extrair_todos_autores_pdf(pdf_path, cb_progresso, cb_resultado):
+    """Varre TODAS as páginas do PDF, identifica matérias/regiões e extrai autor de cada uma.
+    Retorna lista de dicts com info do autor + coordenadas."""
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        cb_resultado(erro=str(e))
+        return
+
+    num_paginas = len(doc)
+    todas_materias = []
+
+    for num_pagina in range(num_paginas):
+        pg = num_pagina + 1
+        pagina = doc[num_pagina]
+        pag_w, pag_h = pegar_tamanho_pagina_cm(pagina)
+
+        regioes = []
+
+        # 1) Blocos de texto
+        for bloco in pagina.get_text("blocks"):
+            x0, y0, x1, y1, texto = bloco[0], bloco[1], bloco[2], bloco[3], bloco[4]
+            texto = texto.strip()
+            if not texto or len(texto) < 10:
+                continue
+            w_pt = x1 - x0; h_pt = y1 - y0
+            if w_pt < 20 or h_pt < 8:
+                continue
+            if len(texto) <= 4 and texto.isdigit():
+                continue
+            regioes.append((x0, y0, x1, y1, {"fonte": "texto", "texto": texto}))
+
+        # 2) Imagens embutidas
+        for info_img in pagina.get_images(full=True):
+            xref = info_img[0]
+            try:
+                rects = pagina.get_image_rects(xref)
+                if not rects:
+                    continue
+                r = rects[0]
+                if r.width < 10 or r.height < 10:
+                    continue
+                regioes.append((r.x0, r.y0, r.x1, r.y1,
+                                {"fonte": "embutida", "xref": xref}))
+            except Exception:
+                pass
+
+        if not regioes:
+            cb_progresso(pg, num_paginas, pg)
+            continue
+
+        # Agrupa regiões próximas
+        grupos = _agrupar_regioes(regioes, tolerancia=14)
+
+        # Filtra muito pequenos
+        for gx0, gy0, gx1, gy1, meta in grupos:
+            w_cm = pontos_para_cm(gx1 - gx0)
+            h_cm = pontos_para_cm(gy1 - gy0)
+            if w_cm * h_cm < 5.0:
+                continue
+
+            # Extrai texto da região
+            rect = fitz.Rect(gx0, gy0, gx1, gy1)
+            texto_regiao = pagina.get_text("text", clip=rect)
+            if not texto_regiao or len(texto_regiao.strip()) < 15:
+                continue
+
+            info_autor = extrair_autor(texto_regiao)
+
+            # Gera trecho representativo
+            trecho = " ".join(texto_regiao.split())[:200]
+
+            todas_materias.append({
+                "pagina":  pg,
+                "x_cm":    pontos_para_cm(gx0),
+                "y_cm":    pontos_para_cm(gy0),
+                "w_cm":    w_cm,
+                "h_cm":    h_cm,
+                "x0_pt":   gx0, "y0_pt": gy0,
+                "x1_pt":   gx1, "y1_pt": gy1,
+                "pag_w":   pag_w,
+                "pag_h":   pag_h,
+                "trecho":  trecho,
+                "autor_info": info_autor,
+            })
+
+        cb_progresso(pg, num_paginas, pg)
+
+    doc.close()
+
+    if not todas_materias:
+        cb_resultado(erro="Nenhuma matéria/autor encontrado no PDF.")
+        return
+
+    cb_resultado(materias=todas_materias, total=len(todas_materias), erro=None)
 
 
 def normalizar(texto):
     # Remove acentos, coloca tudo minusculo, separa palavras coladas por CamelCase
     # e remove pontuacao — resolve o problema do OCR juntar palavras
-    texto = unicodedata.normalize("NFD", texto)
-    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
+    texto = _uc_autor.normalize("NFD", texto)
+    texto = "".join(c for c in texto if _uc_autor.category(c) != "Mn")
     texto = texto.lower()
     # Separa palavras grudadas por letra maiuscula (ex: "MunicípiodeSanta" -> "municipio de santa")
-    texto = _re.sub(r"([a-z])([A-Z])", r"\1 \2", texto)
+    texto = _re_autor.sub(r"([a-z])([A-Z])", r"\1 \2", texto)
     # Separa letras de numeros colados (ex: "N002" -> "N 002")
-    texto = _re.sub(r"([a-zA-Z])([0-9])", r"\1 \2", texto)
-    texto = _re.sub(r"([0-9])([a-zA-Z])", r"\1 \2", texto)
+    texto = _re_autor.sub(r"([a-zA-Z])([0-9])", r"\1 \2", texto)
+    texto = _re_autor.sub(r"([0-9])([a-zA-Z])", r"\1 \2", texto)
     # Remove pontuacao e caracteres especiais
-    texto = _re.sub(r"[^a-z0-9 ]", " ", texto)
+    texto = _re_autor.sub(r"[^a-z0-9 ]", " ", texto)
     # Colapsa espacos multiplos
     texto = " ".join(texto.split())
     return texto
+
+
+def _remover_acentos_simples(texto: str) -> str:
+    """Remove acentos para busca case-insensitive robusta."""
+    import unicodedata
+    return "".join(
+        c for c in unicodedata.normalize("NFD", texto)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def _search_exact_name(name: str, text: str) -> list:
+    """Retorna lista de re.Match do nome exato em text.
+
+    Normaliza ambos (sem acentos, minúsculas) e usa \\b em torno do
+    nome completo — "Luiz Teles" só casa com "Luiz Teles", nunca com
+    "Luiz" ou "Luis Teles" isolados.
+    """
+    import re as _re_exact
+    name_norm = _remover_acentos_simples(name.strip()).lower()
+    # Espaços internos do nome podem virar 1+ espaços ou quebras de linha no PDF
+    partes = [_re_exact.escape(p) for p in name_norm.split()]
+    if not partes:
+        return []
+    # Une as partes com \s+ para tolerar espaços múltiplos/quebras de linha
+    padrao = _re_exact.compile(r"\b" + r"\s+".join(partes) + r"\b",
+                                _re_exact.IGNORECASE)
+    text_norm = _remover_acentos_simples(text).lower()
+    return list(padrao.finditer(text_norm))
+
+
+def buscar_autor_no_pdf(pdf_path: str, nome_busca: str) -> list:
+    """Busca um nome de autor em todas as páginas do PDF.
+
+    Retorna lista de dicts:
+        [{pagina: int, trechos: [str]}, ...]
+    onde cada trecho é um fragmento de ~120 chars ao redor da ocorrência.
+    A busca é case-insensitive, ignora acentos e é EXATA:
+    "Luiz Teles" só encontra "Luiz Teles", não "Luiz" isolado.
+    """
+    import fitz  # PyMuPDF
+
+    if not nome_busca or not nome_busca.strip():
+        return []
+
+    resultados = []
+    try:
+        doc = fitz.open(pdf_path)
+        for num_pag in range(len(doc)):
+            pagina = doc[num_pag]
+            texto_pag = pagina.get_text("text") or ""
+
+            matches = _search_exact_name(nome_busca, texto_pag)
+            if not matches:
+                continue
+
+            trechos = []
+            CONTEXTO = 60  # chars antes e depois
+            # Busca nos offsets do texto normalizado mas exibe texto original
+            texto_norm = _remover_acentos_simples(texto_pag).lower()
+            for m in matches:
+                inicio = max(0, m.start() - CONTEXTO)
+                fim    = min(len(texto_pag), m.end() + CONTEXTO)
+                trecho = texto_pag[inicio:fim].replace("\n", " ").strip()
+                trecho = " ".join(trecho.split())
+                if trecho and trecho not in trechos:
+                    trechos.append(trecho)
+
+            if trechos:
+                resultados.append({"pagina": num_pag + 1, "trechos": trechos})
+
+        doc.close()
+    except Exception as exc:
+        return [{"pagina": 0, "trechos": [f"Erro ao abrir PDF: {exc}"]}]
+
+    return resultados
+
+
+def load_names_from_txt(file_path: str) -> list:
+    """Lê um arquivo .txt e retorna lista de nomes (um por linha).
+    Ignora linhas vazias e linhas que começam com '#'.
+    """
+    nomes = []
+    try:
+        with open(file_path, encoding="utf-8", errors="replace") as f:
+            for linha in f:
+                nome = linha.strip()
+                if nome and not nome.startswith("#"):
+                    nomes.append(nome)
+    except Exception as exc:
+        raise IOError(f"Não foi possível ler o arquivo: {exc}")
+    return nomes
+
+
+def search_multiple_names(names: list, pdf_path: str) -> dict:
+    """Busca vários nomes no PDF e retorna um dict:
+        {nome: [pagina1, pagina2, ...], ...}
+    Páginas sem resultado ficam com lista vazia.
+    """
+    resultado = {}
+    for nome in names:
+        ocorrencias = buscar_autor_no_pdf(pdf_path, nome)
+        # Extrai só os números de página, ordenados e sem repetição
+        paginas = sorted({r["pagina"] for r in ocorrencias if r["pagina"] > 0})
+        resultado[nome] = paginas
+    return resultado
+
+
+def extrair_autores_ataarde(texto: str) -> dict:
+    """Extrai autores do jornal A TARDE a partir do texto completo do PDF.
+
+    Padrões detectados (da análise real do PDF):
+      1. NOME_CAPS*  — byline de jornalista com asterisco (sempre Jornalista)
+      2. NOME_CAPS   — byline em ALLCAPS sozinho na linha (com filtros rígidos)
+      3. NOME_CAPS email@grupoatarde.com.br — jornalista + email editorial
+      4. Nome / Cargo  ou  Nome - Cargo  — cargo explícito
+      5. Por: Nome  /  Texto: Nome  /  Reportagem: Nome
+      6. Charge/Ilustração de Nome
+      7. Email pessoal (@gmail etc.) com nome antes na mesma linha (leitores)
+    """
+    import re
+    import unicodedata
+    from collections import defaultdict
+
+    if not texto or len(texto.strip()) < 100:
+        return {"total_autores": 0, "autores_unicos": [], "por_categoria": {}}
+
+    def _norm(s: str) -> str:
+        return "".join(
+            c for c in unicodedata.normalize("NFD", s)
+            if unicodedata.category(c) != "Mn"
+        ).lower()
+
+    # ── Blacklist: palavras (normalizadas) que nunca fazem parte de nomes ──
+    _BL = {
+        # Esporte
+        "copa", "liga", "esporte", "clube", "esportes", "basquete", "futebol",
+        "placar", "giramundo", "telinha", "real", "madrid", "mundial",
+        "brasileiro", "brasileira", "campeonato", "rodada", "feminino", "masculino",
+        "tenis", "rugby", "volei", "natacao", "atletismo", "jogos", "olimpico",
+        # Tempo / previsão
+        "sol", "chuva", "nuvens", "vento", "forte", "tempo", "clima", "previsao",
+        # Seções e temas jornalísticos
+        "metas", "distintas", "distintos", "ensino", "superior", "habitacao",
+        "crise", "politica", "investigacao", "homenagem", "tradicao",
+        "cidadania", "seguranca", "economia", "saude", "educacao", "cultura",
+        "tecnologia", "policia", "celebracao", "tragedia", "cotidiano",
+        "nacional", "internacional", "regional", "especial",
+        "noticias", "noticia", "novidade", "novidades",
+        "assembleia", "extraordinaria", "extraordinario",
+        "relacoes", "exteriores", "judiciario", "judiciaria",
+        # Automóveis (seção Auto)
+        "auto", "motor", "turbo", "autonomia", "autos", "automovel",
+        # Institucional
+        "prefeitura", "municipal", "governo", "estado", "federal",
+        "ministerio", "secretaria", "tribunal", "congresso", "camara", "senado",
+        "complexo", "hospitalar", "ufba", "uesc", "banco", "poder",
+        # Vocabulário de jornal / mídia
+        "imprensa", "fundador", "jornais", "verificador", "portal",
+        "foto", "fotografia", "fatos", "causos", "fotos", "agencia", "presse",
+        "poucas", "boas", "charge", "astrologia",
+        # Cemitérios / morte
+        "bosque", "jardim", "saudade", "paz", "campo", "santo", "cemiterio",
+        "falecimento", "obito", "obituario",
+        # Dias / tempo
+        "domingo", "segunda", "terca", "quarta", "quinta", "sexta", "sabado",
+        "hoje", "ontem", "amanha", "semana", "mes", "ano",
+        # Lugares comuns (não são sobrenomes de jornalistas)
+        "brasil", "bahia", "nordeste", "regiao", "cidade", "capital",
+        "rio", "preto", "lapa", "salvador", "territorio", "municipio",
+        "distrito", "estado", "pais", "mundo", "france", "sao",
+        # Artigos / preposições sozinhos em CAPS
+        "de", "da", "do", "dos", "das", "a", "o", "os", "as",
+        "em", "no", "na", "nos", "nas", "e", "ou", "um", "uma",
+        "for", "the", "and",
+        # Outros falsos positivos observados no PDF
+        "dia", "outras", "outros", "hora", "horas", "anos", "dias",
+        "meses", "semanas", "digital", "eletronico", "eletronica",
+        "publicas", "publicos", "novo", "nova", "grande", "pequeno",
+        "presas", "setor", "hectares", "serrinha",
+        "musica", "heranca", "eleicoes", "audiencia", "combustiveis",
+        "turismo", "sustentavel", "extrema", "direita", "conflitos",
+        "recentes", "exercicio", "financeiro", "energetica", "segura",
+        # Frases / topicos adicionais detectados em ALLCAPS
+        "artistas", "consagrados", "conjunta", "conjunto", "acao",
+        "outro", "outra", "lado", "frente", "fundo", "nota",
+        "byd", "song", "plus", "pro", "max",  # marcas em inglês / automóveis
+        "norte", "sul","leste", "oeste",
+        "cena", "video", "texto",
+        "alerta", "perigo", "risco", "cuidado", "atencao",
+        "mais", "menos", "cada", "toda", "todo", "todos", "todas",
+        "nova", "velho", "velha", "melhor", "pior",
+    }
+
+    # Preposições/artigos em CAPS (nunca iniciam nem terminam um nome)
+    _PREP_CAPS = {"DE", "DA", "DO", "DOS", "DAS", "EM", "NO", "NA",
+                  "NOS", "NAS", "UM", "UMA", "FOR", "OU", "E", "A", "O",
+                  "OS", "AS", "AO", "AOS"}
+
+    # Palavras que aparecem em fragmentos de texto, nunca em nomes de pessoas (TC)
+    _NOMES_NUNCA_TC = {
+        "que", "se", "mas", "por", "para", "sobre", "entre", "com",
+        "seus", "suas", "nosso", "nossos", "nossa", "nossas",
+        "isso", "esta", "este", "esse", "essa", "aquela", "aquele",
+        "apenas", "ainda", "tambem", "cada", "dentro", "fora",
+        "antes", "depois", "sempre", "nunca", "muito", "pouco",
+        "mais", "menos", "bem", "mal", "quando", "onde", "como",
+        "recente", "recentes", "coletiva", "coletivo",
+        "disponivel", "disponivel", "importante", "preocupante",
+        "sustentavel", "digital", "shows", "turismo",
+        "faz", "vai", "vao", "tem", "sao", "sao", "eram",
+        "estao", "esta", "pelo", "pela", "pelos", "pelas",
+        "era", "vice", "assim", "neste", "nesta", "nessa", "nesse",
+    }
+
+    # Terminações de verbos conjugados (nunca estão em nomes de pessoas)
+    _RE_VERBO_ENDING = re.compile(
+        r'(?:ou|aram|eram|iram|ando|endo|indo|arão|erão|irão'
+        r'|ificar|izar|ecer|armos|ermos|irmos'
+        r'|aram$|iram$|avam$|ivam$)$',
+        re.IGNORECASE
+    )
+
+    # ── Regexes ───────────────────────────────────────────────────────────
+    _RE_CAPS_ONLY = re.compile(
+        r'^[A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s\.\-]{2,60}$')
+
+    _RE_ASTERISCO = re.compile(
+        r'([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s]{3,50})\s*\*')
+
+    _RE_CARGO = re.compile(
+        r'([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-záéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ\s]{3,40})'
+        r'\s*(?:/|\||–|-)\s*'
+        r'(Jornalista|Redator[a]?|Colunista|Editor[a]?|Rep[oó]rter|'
+        r'Leitor[a]?|Deputad[ao]|Prefeito|Prefeita|Vereador[a]?|'
+        r'Senador[a]?|Governador[a]?|Secret[aá]ri[oa]|Correspondente)',
+        re.IGNORECASE)
+
+    _RE_PREFIXO = re.compile(
+        r'^\s*(?:por|texto de|texto|reportagem de|reportagem'
+        r'|enviado por|enviado)\s*:?\s+'
+        r'([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-záéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ\s]{3,40}?)'
+        r'(?:\s*[\*,\.]|\s*$)',
+        re.IGNORECASE)
+
+    _RE_CHARGE = re.compile(
+        r'\b(?:charge|ilustra[cç][aã]o|chargista)\b[^:]*?(?:de|por|:)\s*'
+        r'([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-záéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ\s]{3,40?})'
+        r'(?:\s*[\*,\.]|\s*$)',
+        re.IGNORECASE)
+
+    # Nome ALLCAPS + email editorial na mesma linha (ex: NÚBIA CRISTINA email@at...)
+    _RE_CAPS_EMAIL = re.compile(
+        r'^([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s]{3,40})\s+'
+        r'[\w\.\-]+@[\w\.\-]+\.[a-z]{2,}$')
+
+    # Email pessoal com nome em TC antes (ex: João Silva joao@gmail.com)
+    _RE_EMAIL_NOME_TC = re.compile(
+        r'([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-záéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ]{2,20}'
+        r'(?:\s+[A-Za-záéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ]{2,20}){1,3})'
+        r'\s+[\w\.\-]+@[\w\.\-]+\.\w+')
+
+    _CARGOS_POLITICO = re.compile(
+        r'\b(deputad[ao]|prefeito|prefeita|vereador[a]?|senador[a]?'
+        r'|governador[a]?|secretári[oa]|ministro|ministra)\b', re.IGNORECASE)
+
+    _EMAIL_ANY = re.compile(r'@[\w\.\-]+\.\w+')
+
+    # Cabeçalho de página do A TARDE (reset de seção)
+    _RE_CABECALHO = re.compile(
+        r'SALVADOR\s+(?:SEGUNDA|TERCA|QUARTA|QUINTA|SEXTA|SABADO|DOMINGO)'
+        r'[\-\s]FEIRA', re.IGNORECASE)
+
+    # ── Prioridade de categoria (nunca rebaixa uma classificação maior) ───
+    _PRIO = {
+        'Jornalistas / Redatores': 3,
+        'Colunistas':              2,
+        'Políticos / Opinião':     2,
+        'Leitores':                1,
+    }
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+    def _caps_e_nome_pessoa(linha: str) -> bool:
+        """True se a linha ALLCAPS parece nome de pessoa."""
+        palavras = linha.split()
+        if len(palavras) < 2 or len(palavras) > 4:
+            return False
+        for p in palavras:
+            if not re.match(r'^[A-ZÁÉÍÓÚÂÊÔÃÕÇ\-]{2,20}$', p):
+                return False
+            if _norm(p) in _BL:
+                return False
+        if palavras[0] in _PREP_CAPS or palavras[-1] in _PREP_CAPS:
+            return False
+        return True
+
+    def _nome_valido_tc(nome: str) -> bool:
+        """True se 'nome' em Title Case parece um nome de pessoa real."""
+        palavras = nome.split()
+        if len(palavras) < 2 or len(palavras) > 4:
+            return False
+        for p in palavras:
+            p_norm = _norm(p)
+            if p_norm in _BL:
+                return False
+            if p_norm in _NOMES_NUNCA_TC:
+                return False
+            # Rejeita palavras com terminações típicas de verbo conjugado
+            if _RE_VERBO_ENDING.search(p_norm):
+                return False
+            # Preposição/artigo sozinho
+            if p.upper() in _PREP_CAPS:
+                return False
+            # Cada palavra deve começar com maiúscula e ter 2+ chars
+            if len(p) < 2 or not p[0].isupper():
+                return False
+        # Rejeita se há 2+ palavras inteiramente em CAPS (já cobre ALLCAPS path)
+        caps_words = sum(1 for p in palavras if p.isupper() and len(p) > 2)
+        if caps_words >= 2:
+            return False
+        return True
+
+    def _classificar(linha_lower: str) -> str:
+        if _EMAIL_ANY.search(linha_lower) or any(
+                x in linha_lower for x in ['@gmail', '@yahoo', '@hotmail']):
+            return 'Leitores'
+        if _CARGOS_POLITICO.search(linha_lower):
+            return 'Políticos / Opinião'
+        if any(x in linha_lower for x in ['colunista', 'articulista', 'cronista']):
+            return 'Colunistas'
+        return 'Jornalistas / Redatores'
+
+    def _reg(nome: str, cat: str):
+        nome = nome.strip().rstrip('*., ').title()
+        if not _nome_valido_tc(nome):
+            return
+        # Nunca rebaixa categoria já registrada
+        if nome not in autores or _PRIO.get(cat, 0) > _PRIO.get(autores[nome], 0):
+            autores[nome] = cat
+
+    # ── Varredura ─────────────────────────────────────────────────────────
+    autores: dict[str, str] = {}
+    linhas = texto.split('\n')
+    secao_leitor = False
+
+    for linha_raw in linhas:
+        linha = linha_raw.strip()
+        if len(linha) < 3:
+            continue
+        linha_lower = _norm(linha)
+
+        # ── Reset de seção a cada cabeçalho de página ─────────────────────
+        if _RE_CABECALHO.search(linha):
+            secao_leitor = False
+            continue
+
+        # ── Detecta entrada na seção "Espaço do Leitor" ───────────────────
+        if any(x in linha_lower for x in
+               ['espaco do leitor', 'cartas do leitor', 'espaco leitor',
+                'leitor escreve']):
+            secao_leitor = True
+
+        # ── ALLCAPS: asterisco → sempre Jornalista ────────────────────────
+        m = _RE_ASTERISCO.search(linha)
+        if m and _RE_CAPS_ONLY.match(linha.rstrip('* ')):
+            nome_caps = m.group(1).strip()
+            if _caps_e_nome_pessoa(nome_caps):
+                # Asterisco indica supervisão editorial → sempre Jornalista
+                if nome_caps.title() not in autores or autores[nome_caps.title()] == 'Leitores':
+                    autores[nome_caps.title()] = 'Jornalistas / Redatores'
+            continue
+
+        # ── ALLCAPS: nome + email editorial (ex: NÚBIA CRISTINA email@at...) ─
+        m = _RE_CAPS_EMAIL.match(linha)
+        if m:
+            nome_caps = m.group(1).strip()
+            if _caps_e_nome_pessoa(nome_caps):
+                n = nome_caps.title()
+                # A presença do email editorial sinaliza jornalista
+                if n not in autores or _PRIO.get('Jornalistas / Redatores', 0) > _PRIO.get(autores[n], 0):
+                    autores[n] = 'Jornalistas / Redatores'
+            continue
+
+        # ── ALLCAPS puro: byline de jornalista ────────────────────────────
+        # ALLCAPS nomes são sempre tratados como jornalistas/colaboradores;
+        # leitores são identificados via email ou secao_leitor em TC.
+        if _RE_CAPS_ONLY.match(linha):
+            if _caps_e_nome_pessoa(linha):
+                n = linha.title()
+                if n not in autores:
+                    autores[n] = 'Jornalistas / Redatores'
+                # Nunca rebaixa de Jornalista para Leitor via ALLCAPS
+            continue   # linha CAPS: não aplica regras TC abaixo
+
+        # A partir daqui: linhas que NÃO são todo em ALLCAPS
+
+        if linha.endswith(':') or linha.endswith('...'):
+            continue
+
+        # ── Cargo explícito: Nome / Jornalista ───────────────────────────
+        m = _RE_CARGO.search(linha)
+        if m:
+            _reg(m.group(1), _classificar(_norm(linha)))
+
+        # ── Email pessoal com nome em TC antes ────────────────────────────
+        m = _RE_EMAIL_NOME_TC.search(linha)
+        if m:
+            _reg(m.group(1), 'Leitores')
+
+        # ── Prefixo "Por:", "Reportagem de:" ─────────────────────────────
+        m = _RE_PREFIXO.match(linha)
+        if m:
+            cat = 'Leitores' if secao_leitor else _classificar(_norm(linha))
+            _reg(m.group(1), cat)
+
+        # ── Charge / ilustração de Nome ───────────────────────────────────
+        m = _RE_CHARGE.search(linha)
+        if m:
+            _reg(m.group(1), 'Colunistas')
+
+    # ── Resultado ─────────────────────────────────────────────────────────
+    categorias: dict[str, list] = defaultdict(list)
+    for nome, cat in autores.items():
+        categorias[cat].append(nome)
+
+    return {
+        "total_autores": len(autores),
+        "autores_unicos": sorted(autores),
+        "por_categoria": {cat: sorted(nomes) for cat, nomes in categorias.items()},
+    }
 
 
 def palavras_relevantes(texto, tamanho_minimo=3):
@@ -793,14 +2354,14 @@ def criar_bloco_metricas(parent, w_px, h_px, w_cm_pdf, h_cm_pdf,
             usar_w = w_cm_pdf if w_cm_pdf else cm_via_dpi()[0]
             usar_h = h_cm_pdf if h_cm_pdf else cm_via_dpi()[1]
 
-            lbl_pdf.config(text=f"L {usar_w:.2f} cm  x  A {usar_h:.2f} cm")
+            lbl_pdf.config(text=f"L {usar_w:.3f} cm  x  A {usar_h:.3f} cm")
 
             if papel and pag_w_cm and pag_h_cm:
                 escala = escalar_para_jornal(usar_w, usar_h,
                                              pag_w_cm, pag_h_cm,
                                              papel[0], papel[1])
                 lbl_print.config(
-                    text=f"L {escala['w_cm']:.2f} cm  x  A {escala['h_cm']:.2f} cm",
+                    text=f"L {escala['w_cm']:.3f} cm  x  A {escala['h_cm']:.3f} cm",
                     fg=CORES["verde"])
             else:
                 lbl_print.config(text="-- selecione um formato --", fg=CORES["texto3"])
@@ -808,9 +2369,9 @@ def criar_bloco_metricas(parent, w_px, h_px, w_cm_pdf, h_cm_pdf,
             if pag_w_cm and pag_h_cm:
                 prop = calcular_proporcao(usar_w, usar_h, pag_w_cm, pag_h_cm)
                 lbl_prop.config(
-                    text=f"Larg: {prop['w_pct']:.1f}%  "
-                         f"Alt: {prop['h_pct']:.1f}%  "
-                         f"Area: {prop['area_pct']:.1f}%")
+                    text=f"Larg: {prop['w_pct']:.2f}%  "
+                         f"Alt: {prop['h_pct']:.2f}%  "
+                         f"Area: {prop['area_pct']:.2f}%")
             else:
                 lbl_prop.config(text="--")
         except tk.TclError:
@@ -853,13 +2414,13 @@ def criar_bloco_metricas(parent, w_px, h_px, w_cm_pdf, h_cm_pdf,
 
     if x_cm is not None and y_cm is not None:
         linha_pos = nova_linha(" POS  ", CORES["amarelo"])
-        tk.Label(linha_pos, text=f"X {x_cm:.2f} cm  Y {y_cm:.2f} cm",
+        tk.Label(linha_pos, text=f"X {x_cm:.3f} cm  Y {y_cm:.3f} cm",
                  font=FONTE_MONO_P, fg=CORES["texto2"],
                  bg=CORES["painel2"], padx=6).pack(side="left")
 
     if pag_w_cm and pag_h_cm:
         linha_pag = nova_linha(" PAG  ", CORES["texto3"])
-        tk.Label(linha_pag, text=f"L {pag_w_cm:.2f} cm  x  A {pag_h_cm:.2f} cm",
+        tk.Label(linha_pag, text=f"L {pag_w_cm:.3f} cm  x  A {pag_h_cm:.3f} cm",
                  font=FONTE_MONO_P, fg=CORES["texto3"],
                  bg=CORES["painel2"], padx=6).pack(side="left")
 
@@ -887,6 +2448,7 @@ class App(tk.Tk):
 
         self.caminho_pdf    = tk.StringVar()
         self.caminho_img    = tk.StringVar()
+        self._lista_imagens = []   # lista de caminhos (strings)
         self.metodo_busca   = tk.StringVar(value="phash")
         self.limiar         = tk.DoubleVar(value=0.85)
         self.dpi            = tk.DoubleVar(value=96.0)
@@ -916,10 +2478,48 @@ class App(tk.Tk):
         corpo = tk.Frame(self, bg=CORES["fundo"])
         corpo.pack(fill="both", expand=True, padx=24, pady=10)
 
-        painel_esq = tk.Frame(corpo, bg=CORES["fundo"], width=390)
-        painel_esq.pack(side="left", fill="y")
-        painel_esq.pack_propagate(False)
+        # Painel esquerdo com scroll de mouse
+        _esq_outer = tk.Frame(corpo, bg=CORES["fundo"], width=390)
+        _esq_outer.pack(side="left", fill="y")
+        _esq_outer.pack_propagate(False)
+
+        _esq_canvas = tk.Canvas(_esq_outer, bg=CORES["fundo"],
+                                width=390, highlightthickness=0)
+        _esq_scroll = tk.Scrollbar(_esq_outer, orient="vertical",
+                                   command=_esq_canvas.yview)
+        _esq_canvas.configure(yscrollcommand=_esq_scroll.set)
+        _esq_canvas.pack(side="left", fill="both", expand=True)
+        # Scrollbar só aparece se necessário (não ocupa espaço fixo)
+        _esq_scroll.pack(side="right", fill="y")
+
+        painel_esq = tk.Frame(_esq_canvas, bg=CORES["fundo"])
+        _esq_win = _esq_canvas.create_window((0, 0), window=painel_esq, anchor="nw")
+
+        def _ajustar_scroll(event=None):
+            _esq_canvas.configure(scrollregion=_esq_canvas.bbox("all"))
+            _esq_canvas.itemconfig(_esq_win, width=_esq_canvas.winfo_width())
+
+        painel_esq.bind("<Configure>", _ajustar_scroll)
+        _esq_canvas.bind("<Configure>",
+                         lambda e: _esq_canvas.itemconfig(_esq_win, width=e.width))
+
+        def _scroll_mouse(event):
+            _esq_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        # Vincula scroll do mouse ao canvas e a todos os filhos dinamicamente
+        def _bind_scroll(widget):
+            widget.bind("<MouseWheel>", _scroll_mouse)
+            for child in widget.winfo_children():
+                _bind_scroll(child)
+
+        painel_esq.bind("<MouseWheel>", _scroll_mouse)
+        _esq_canvas.bind("<MouseWheel>", _scroll_mouse)
+        # Re-vincula sempre que novos widgets forem adicionados ao painel
+        painel_esq.bind("<Configure>", lambda e: (_ajustar_scroll(), _bind_scroll(painel_esq)))
+
         self._painel_esq = painel_esq
+        self._esq_canvas = _esq_canvas
+        self._bind_scroll_esq = _bind_scroll
         self._montar_painel_esquerdo(painel_esq)
 
         tk.Frame(corpo, bg=CORES["borda"], width=1).pack(side="left", fill="y", padx=14)
@@ -938,13 +2538,27 @@ class App(tk.Tk):
                                      icone="PDF", ao_clicar=self._selecionar_pdf)
         self._btn_pdf.pack(fill="x")
 
-        frame_img = tk.Frame(parent, bg=CORES["painel"],
-                             highlightbackground=CORES["borda"], highlightthickness=1)
-        frame_img.pack(fill="x", pady=(0, 6))
-        self._btn_img = BotaoArquivo(frame_img,
-                                     texto="Clique para selecionar a imagem de busca",
-                                     icone="IMG", ao_clicar=self._selecionar_imagem)
-        self._btn_img.pack(fill="x")
+        # ---- Bloco de multiplas imagens ----
+        tk.Label(parent, text="IMAGENS DE BUSCA", font=("Segoe UI", 8, "bold"),
+                 fg=CORES["azul"], bg=CORES["fundo"], anchor="w").pack(
+                     fill="x", pady=(6, 2))
+
+        self._frame_imgs = tk.Frame(parent, bg=CORES["fundo"])
+        self._frame_imgs.pack(fill="x")
+
+        linha_btn_imgs = tk.Frame(parent, bg=CORES["fundo"])
+        linha_btn_imgs.pack(fill="x", pady=(4, 2))
+        tk.Button(linha_btn_imgs, text="+ Adicionar imagem",
+            font=FONTE_PEQUENA, fg=CORES["texto2"], bg=CORES["painel2"],
+            relief="flat", cursor="hand2", padx=8, pady=5,
+            activebackground=CORES["painel3"],
+            command=self._adicionar_imagem
+        ).pack(side="left")
+        tk.Button(linha_btn_imgs, text="Limpar",
+            font=FONTE_PEQUENA, fg=CORES["texto3"], bg=CORES["fundo"],
+            relief="flat", cursor="hand2", padx=6, pady=5,
+            command=self._limpar_imagens
+        ).pack(side="left", padx=(4, 0))
 
         self._lbl_preview = tk.Label(parent, bg=CORES["fundo"])
         self._lbl_preview.pack(pady=(0, 2))
@@ -1089,7 +2703,21 @@ class App(tk.Tk):
             activebackground=CORES["painel3"], activeforeground=CORES["ciano"],
             relief="flat", cursor="hand2", pady=7,
             command=self._iniciar_listagem)
-        self._btn_listar.pack(fill="x")
+        self._btn_listar.pack(fill="x", pady=(0, 5))
+
+        self._btn_autores = tk.Button(parent, text="Extrair Autores",
+            font=("Segoe UI", 9, "bold"), fg=CORES["texto2"], bg=CORES["painel2"],
+            activebackground=CORES["painel3"], activeforeground=CORES["lilas"],
+            relief="flat", cursor="hand2", pady=7,
+            command=self._iniciar_extracao_autores)
+        self._btn_autores.pack(fill="x", pady=(0, 5))
+
+        self._btn_autores_atarde = tk.Button(parent, text="Autores A TARDE",
+            font=("Segoe UI", 9, "bold"), fg=CORES["texto2"], bg=CORES["painel2"],
+            activebackground=CORES["painel3"], activeforeground=CORES["ciano"],
+            relief="flat", cursor="hand2", pady=7,
+            command=self._iniciar_extracao_atarde)
+        self._btn_autores_atarde.pack(fill="x")
 
     def _montar_painel_direito(self, parent):
         self._lbl_status = tk.Label(parent, text="Aguardando...",
@@ -1128,8 +2756,22 @@ class App(tk.Tk):
         self._abas.add(self._aba_texto, text="Busca por Texto (OCR)")
         self._montar_aba_texto(self._aba_texto)
 
+        self._aba_autores = tk.Frame(self._abas, bg=CORES["painel"])
+        self._abas.add(self._aba_autores, text="Autores")
+        self._canvas_autores, self._frame_autores = self._criar_area_rolavel(self._aba_autores)
+
+        self._aba_buscar_autor = tk.Frame(self._abas, bg=CORES["painel"])
+        self._abas.add(self._aba_buscar_autor, text="Buscar Autor")
+        self._montar_aba_buscar_autor(self._aba_buscar_autor)
+
+        self._aba_autores_atarde = tk.Frame(self._abas, bg=CORES["painel"])
+        self._abas.add(self._aba_autores_atarde, text="Autores A TARDE")
+        self._canvas_autores_atarde, self._frame_autores_atarde = \
+            self._criar_area_rolavel(self._aba_autores_atarde)
+
         self._mostrar_placeholder(self._frame_busca, "busca")
         self._mostrar_placeholder(self._frame_lista, "lista")
+        self._mostrar_placeholder(self._frame_autores, "autores")
 
     def _montar_aba_texto(self, parent):
         topo = tk.Frame(parent, bg=CORES["fundo"])
@@ -1381,31 +3023,71 @@ class App(tk.Tk):
                      fg=CORES["texto2"], bg=CORES["painel2"], padx=6).pack(side="left")
 
         nova_linha_m(" POS  ", CORES["amarelo"],
-            f"X {dados['x_cm']:.2f} cm  Y {dados['y_cm']:.2f} cm")
+            f"X {dados['x_cm']:.3f} cm  Y {dados['y_cm']:.3f} cm")
         nova_linha_m(" TAM  ", CORES["ciano"],
-            f"L {dados['w_cm']:.2f} cm  x  A {dados['h_cm']:.2f} cm")
+            f"L {dados['w_cm']:.3f} cm  x  A {dados['h_cm']:.3f} cm")
 
         # Colunagem do jornal ativo
         nome_jornal = self.jornal_ativo.get()
         jornal = JORNAIS_CADASTRADOS.get(nome_jornal)
         if jornal:
-            num_col = calcular_colunas(dados["w_cm"], jornal)
-            larg_col = largura_de_n_colunas(num_col, jornal)
+            info = calcular_info_colunas(
+                dados["w_cm"], dados.get("x_cm") or 0.0, jornal)
             formato_nome = identificar_formato(
                 dados["w_cm"], dados["h_cm"],
                 jornal["largura"], jornal["altura"])
+            sinal = "+" if info["desvio"] >= 0 else ""
             nova_linha_m(" COL  ", CORES["lilas"],
-                f"{num_col} col  ({larg_col:.2f} cm)  x  {dados['h_cm']:.1f} cm alt")
+                f"Col {info['col_ini']} a {info['col_fim']}  "
+                f"|  {info['num_col']} col ({info['cols_exato']:.3f} exato)  "
+                f"|  alt {dados['h_cm']:.3f} cm")
+            nova_linha_m(" DIM  ", CORES["ciano"],
+                f"Padrao {info['larg_padrao']:.3f} cm  "
+                f"|  Medido {dados['w_cm']:.3f} cm  "
+                f"|  Δ {sinal}{info['desvio']:.3f} cm")
+            nova_linha_m(" 1COL ", CORES["texto2"],
+                f"1 col = {info['larg_1col']:.3f} cm  "
+                f"|  margem = {info['margem']:.3f} cm")
             nova_linha_m(" FMT  ", CORES["roxo"], formato_nome)
 
         if dados.get("pag_w") and dados.get("pag_h"):
             prop = calcular_proporcao(dados["w_cm"], dados["h_cm"],
                                       dados["pag_w"], dados["pag_h"])
             nova_linha_m(" PROP ", CORES["verde"],
-                f"Larg: {prop['w_pct']:.1f}%  Alt: {prop['h_pct']:.1f}%  "
-                f"Area: {prop['area_pct']:.1f}%")
+                f"Larg: {prop['w_pct']:.2f}%  Alt: {prop['h_pct']:.2f}%  "
+                f"Area: {prop['area_pct']:.2f}%")
             nova_linha_m(" PAG  ", CORES["texto3"],
-                f"L {dados['pag_w']:.2f} cm  x  A {dados['pag_h']:.2f} cm")
+                f"L {dados['pag_w']:.3f} cm  x  A {dados['pag_h']:.3f} cm")
+
+        # ── Autor / Colaborador (busca por texto) ──
+        pdf = self.caminho_pdf.get()
+        if pdf and Path(pdf).exists():
+            try:
+                doc_temp = fitz.open(pdf)
+                pag_temp = doc_temp[dados["pagina"] - 1]
+                # Usa coordenadas do match para extrair texto
+                x0_pt = dados.get("x_cm", 0) / PT_PARA_CM
+                y0_pt = dados.get("y_cm", 0) / PT_PARA_CM
+                w_pt  = dados.get("w_cm", 0) / PT_PARA_CM
+                h_pt  = dados.get("h_cm", 0) / PT_PARA_CM
+                rect = fitz.Rect(x0_pt, y0_pt, x0_pt + w_pt, y0_pt + h_pt)
+                txt_regiao = pag_temp.get_text("text", clip=rect)
+                doc_temp.close()
+                ai = extrair_autor(txt_regiao)
+                if ai and ai.get("autor"):
+                    tipo_map = {"reporter": "Repórter", "redacao": "Redação",
+                                "articulista": "Articulista", "desconhecido": ""}
+                    tipo_label = tipo_map.get(ai["tipo"], "")
+                    cor_tipo = (CORES["verde"] if ai["confianca"] >= 0.85
+                                else CORES["amarelo"] if ai["confianca"] >= 0.65
+                                else CORES["texto2"])
+                    nova_linha_m(" AUTOR", CORES["verde"],
+                        f"{ai['autor']}  ({tipo_label}  {ai['confianca']:.0%})")
+                    if ai.get("colaboradores"):
+                        nova_linha_m(" COLAB", CORES["ciano"],
+                            ", ".join(ai["colaboradores"]))
+            except Exception:
+                pass
 
         tk.Button(card,
             text="Baixar PDF com marcacao",
@@ -1502,10 +3184,13 @@ class App(tk.Tk):
         j = JORNAIS_CADASTRADOS.get(nome)
         if j:
             lc = largura_coluna(j)
+            area = j["largura"] - j["margem"] * (j["colunas"] - 1)
             self._lbl_jornal_info.config(
                 text=f"  {j['largura']}x{j['altura']} cm  "
                      f"{j['colunas']} col  "
-                     f"1col = {lc:.2f} cm")
+                     f"1col={lc:.3f} cm  "
+                     f"marg={j['margem']:.3f} cm  "
+                     f"util={area:.3f} cm")
         else:
             self._lbl_jornal_info.config(text="  Jornal personalizado")
 
@@ -1579,16 +3264,72 @@ class App(tk.Tk):
             self.caminho_pdf.set(caminho)
             self._btn_pdf.mostrar_arquivo(Path(caminho).name)
 
-    def _selecionar_imagem(self):
-        caminho = filedialog.askopenfilename(
-            title="Selecionar imagem de busca",
+    def _adicionar_imagem(self):
+        caminhos = filedialog.askopenfilenames(
+            title="Selecionar imagem(ns) de busca",
             filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.tiff *.webp"),
                        ("Todos", "*.*")])
-        if caminho:
-            self.caminho_img.set(caminho)
-            self._btn_img.mostrar_arquivo(Path(caminho).name)
+        if caminhos:
+            for c in caminhos:
+                if c not in self._lista_imagens:
+                    self._lista_imagens.append(c)
+            self._atualizar_lista_imagens()
+
+    def _limpar_imagens(self):
+        self._lista_imagens.clear()
+        self._atualizar_lista_imagens()
+        self._lbl_preview.config(image="")
+        try:
+            del self._lbl_preview._foto
+        except AttributeError:
+            pass
+
+    def _atualizar_lista_imagens(self):
+        for w in self._frame_imgs.winfo_children():
+            w.destroy()
+
+        if not self._lista_imagens:
+            tk.Label(self._frame_imgs,
+                     text="Nenhuma imagem adicionada",
+                     font=FONTE_PEQUENA, fg=CORES["texto3"],
+                     bg=CORES["fundo"], anchor="w").pack(fill="x")
+            return
+
+        for idx, caminho in enumerate(self._lista_imagens):
+            linha = tk.Frame(self._frame_imgs, bg=CORES["painel2"],
+                             highlightbackground=CORES["borda"], highlightthickness=1)
+            linha.pack(fill="x", pady=1)
+
+            # Mini-thumb
             try:
-                img = Image.open(caminho).convert("RGB")
+                img_t = Image.open(caminho).convert("RGB")
+                img_t.thumbnail((36, 36), Image.LANCZOS)
+                foto_t = ImageTk.PhotoImage(img_t)
+                lbl_t = tk.Label(linha, image=foto_t, bg=CORES["painel2"])
+                lbl_t.image = foto_t   # evita GC
+                lbl_t.pack(side="left", padx=4, pady=3)
+            except Exception:
+                tk.Label(linha, text="IMG", font=FONTE_BADGE,
+                         fg=CORES["texto3"], bg=CORES["painel2"],
+                         width=5).pack(side="left", padx=4)
+
+            nome = Path(caminho).name
+            nome_curto = nome if len(nome) <= 26 else "..." + nome[-23:]
+            tk.Label(linha, text=f"{idx+1}. {nome_curto}",
+                     font=FONTE_PEQUENA, fg=CORES["texto"],
+                     bg=CORES["painel2"], anchor="w").pack(side="left", fill="x", expand=True)
+
+            idx_local = idx
+            tk.Button(linha, text="x", font=("Segoe UI", 8),
+                      fg=CORES["vermelho"], bg=CORES["painel2"],
+                      relief="flat", cursor="hand2", padx=4,
+                      command=lambda i=idx_local: self._remover_imagem(i)
+                      ).pack(side="right", padx=4)
+
+        # Atualiza preview com a primeira imagem
+        if self._lista_imagens:
+            try:
+                img = Image.open(self._lista_imagens[0]).convert("RGB")
                 img.thumbnail((200, 72), Image.LANCZOS)
                 foto = ImageTk.PhotoImage(img)
                 self._lbl_preview.config(image=foto)
@@ -1596,28 +3337,41 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+    def _remover_imagem(self, idx):
+        if 0 <= idx < len(self._lista_imagens):
+            self._lista_imagens.pop(idx)
+            self._atualizar_lista_imagens()
+
+    # Mantido para compatibilidade com BotaoArquivo antigo (nao usado mais)
+    def _selecionar_imagem(self):
+        self._adicionar_imagem()
+
     def _iniciar_busca(self):
         if self._buscando:
             return
         pdf = self.caminho_pdf.get()
-        img = self.caminho_img.get()
         if not pdf:
             messagebox.showwarning("Atencao", "Selecione um arquivo PDF primeiro.")
             return
-        if not img:
-            messagebox.showwarning("Atencao", "Selecione a imagem de busca.")
+        if not self._lista_imagens:
+            messagebox.showwarning("Atencao", "Adicione ao menos uma imagem de busca.")
             return
         if not Path(pdf).exists():
             messagebox.showerror("Erro", f"Arquivo nao encontrado:\n{pdf}")
             return
-        if not Path(img).exists():
-            messagebox.showerror("Erro", f"Imagem nao encontrada:\n{img}")
-            return
-        try:
-            imagem_busca = Image.open(img).convert("RGB")
-        except Exception as e:
-            messagebox.showerror("Erro", f"Nao foi possivel abrir a imagem:\n{e}")
-            return
+
+        imagens_busca = []
+        for caminho in self._lista_imagens:
+            if not Path(caminho).exists():
+                messagebox.showerror("Erro", f"Imagem nao encontrada:\n{caminho}")
+                return
+            try:
+                imagens_busca.append(Image.open(caminho).convert("RGB"))
+            except Exception as e:
+                messagebox.showerror("Erro",
+                    f"Nao foi possivel abrir:\n{caminho}\n{e}")
+                return
+
         self._buscando = True
         self._btn_buscar.config(text="Analisando...", state="disabled",
                                 bg=CORES["painel2"], fg=CORES["texto2"])
@@ -1627,7 +3381,7 @@ class App(tk.Tk):
         self._abas.select(self._aba_busca)
         threading.Thread(
             target=buscar_imagem_no_pdf,
-            args=(pdf, imagem_busca, METODOS[self.metodo_busca.get()],
+            args=(pdf, imagens_busca, METODOS[self.metodo_busca.get()],
                   self.limiar.get(), self._cb_progresso, self._cb_resultado_busca),
             daemon=True
         ).start()
@@ -1726,6 +3480,8 @@ class App(tk.Tk):
             texto = "Selecione PDF e imagem, depois clique em Iniciar Busca"
         elif aba == "texto":
             texto = "Cole o texto ou rode o OCR, depois clique em Buscar texto no PDF"
+        elif aba == "autores":
+            texto = "Selecione um PDF e clique em Extrair Autores"
         else:
             texto = "Selecione um PDF e clique em Listar Todos os Anuncios"
         tk.Label(frame, text=texto, font=FONTE_LABEL,
@@ -1811,6 +3567,12 @@ class App(tk.Tk):
             tk.Label(linha_titulo, text=f"Pagina {dados['pagina']}",
                      font=("Segoe UI", 11, "bold"),
                      fg=CORES["texto"], bg=CORES["painel2"]).pack(side="left")
+
+            img_idx = dados.get("img_match_idx")
+            if img_idx and img_idx > 1:
+                tk.Label(linha_titulo, text=f"Img #{img_idx}",
+                         font=FONTE_BADGE, fg=CORES["ciano"],
+                         bg=CORES["painel3"], padx=4).pack(side="left", padx=(6, 0))
             score = dados["score"]
             cor_badge = (CORES["verde"] if score >= 0.85
                          else CORES["amarelo"] if score >= 0.65
@@ -1854,11 +3616,12 @@ class App(tk.Tk):
         jornal = JORNAIS_CADASTRADOS.get(nome_jornal)
         w_cm_real = dados.get("w_cm") or 0
         h_cm_real = dados.get("h_cm") or 0
+        x_cm_real = dados.get("x_cm") or 0.0
         if jornal and w_cm_real and h_cm_real:
-            num_col    = calcular_colunas(w_cm_real, jornal)
-            larg_col   = largura_de_n_colunas(num_col, jornal)
-            fmt_nome   = identificar_formato(
+            info     = calcular_info_colunas(w_cm_real, x_cm_real, jornal)
+            fmt_nome = identificar_formato(
                 w_cm_real, h_cm_real, jornal["largura"], jornal["altura"])
+            sinal    = "+" if info["desvio"] >= 0 else ""
 
             frame_col = tk.Frame(area_info, bg=CORES["painel2"])
             frame_col.pack(fill="x", pady=(2, 0))
@@ -1873,8 +3636,49 @@ class App(tk.Tk):
                          padx=6).pack(side="left")
 
             linha_col(" COL  ", CORES["lilas"],
-                f"{num_col} col  ({larg_col:.2f} cm)  x  {h_cm_real:.1f} cm alt")
+                f"Col {info['col_ini']} a {info['col_fim']}  "
+                f"|  {info['num_col']} col ({info['cols_exato']:.3f} exato)  "
+                f"|  alt {h_cm_real:.3f} cm")
+            linha_col(" DIM  ", CORES["ciano"],
+                f"Padrao {info['larg_padrao']:.3f} cm  "
+                f"|  Medido {w_cm_real:.3f} cm  "
+                f"|  Δ {sinal}{info['desvio']:.3f} cm")
+            linha_col(" 1COL ", CORES["texto2"],
+                f"1 col = {info['larg_1col']:.3f} cm  "
+                f"|  margem = {info['margem']:.3f} cm")
             linha_col(" FMT  ", CORES["roxo"], fmt_nome)
+
+        # ── Autor / Colaborador ──
+        autor_info = dados.get("autor_info")
+        if autor_info and autor_info.get("autor"):
+            frame_autor = tk.Frame(area_info, bg=CORES["painel2"])
+            frame_autor.pack(fill="x", pady=(4, 0))
+            tipo_map = {"reporter": "Repórter", "redacao": "Redação",
+                        "articulista": "Articulista", "desconhecido": ""}
+            tipo_label = tipo_map.get(autor_info["tipo"], "")
+            cor_tipo = (CORES["verde"] if autor_info["confianca"] >= 0.85
+                        else CORES["amarelo"] if autor_info["confianca"] >= 0.65
+                        else CORES["texto2"])
+
+            la = tk.Frame(frame_autor, bg=CORES["painel2"])
+            la.pack(fill="x", pady=1)
+            tk.Label(la, text=" AUTOR", font=FONTE_BADGE,
+                     fg=CORES["verde"], bg=CORES["painel3"],
+                     padx=2).pack(side="left")
+            tk.Label(la, text=f"{autor_info['autor']}  ({tipo_label}  {autor_info['confianca']:.0%})",
+                     font=("Consolas", 9, "bold"),
+                     fg=cor_tipo, bg=CORES["painel2"],
+                     padx=6).pack(side="left")
+
+            if autor_info.get("colaboradores"):
+                lc = tk.Frame(frame_autor, bg=CORES["painel2"])
+                lc.pack(fill="x", pady=1)
+                tk.Label(lc, text=" COLAB", font=FONTE_BADGE,
+                         fg=CORES["ciano"], bg=CORES["painel3"],
+                         padx=2).pack(side="left")
+                tk.Label(lc, text=", ".join(autor_info["colaboradores"]),
+                         font=FONTE_MONO_P, fg=CORES["texto2"],
+                         bg=CORES["painel2"], padx=6).pack(side="left")
 
         tk.Button(area_info,
             text="Baixar PDF com marcacao", 
@@ -1886,6 +3690,617 @@ class App(tk.Tk):
             padx=10, pady=7,
             command=lambda d=dados: self._baixar_pdf_marcado([d])
         ).pack(fill="x", pady=(8, 2))
+
+    # ══════════════════════════════════════════════════════════════
+    #  ABA AUTORES — Extração de todos os autores do PDF
+    # ══════════════════════════════════════════════════════════════
+
+    def _iniciar_extracao_autores(self):
+        if self._buscando:
+            return
+        pdf = self.caminho_pdf.get()
+        if not pdf:
+            messagebox.showwarning("Atencao", "Selecione um arquivo PDF primeiro.")
+            return
+        if not Path(pdf).exists():
+            messagebox.showerror("Erro", f"Arquivo nao encontrado:\n{pdf}")
+            return
+        self._buscando = True
+        self._btn_autores.config(text="Extraindo...", state="disabled",
+                                 bg=CORES["painel2"], fg=CORES["texto3"])
+        self._limpar_frame(self._frame_autores)
+        self._barra.atualizar(0)
+        self._lbl_status.config(text="Extraindo autores...", fg=CORES["texto2"])
+        self._abas.select(self._aba_autores)
+        threading.Thread(
+            target=extrair_todos_autores_pdf,
+            args=(pdf, self._cb_progresso_autores, self._cb_resultado_autores),
+            daemon=True
+        ).start()
+
+    def _cb_progresso_autores(self, atual, total, pagina):
+        def atualizar():
+            self._barra.atualizar(atual / total)
+            self._lbl_progresso.config(
+                text=f"Pagina {atual}/{total}", fg=CORES["texto3"])
+            self._lbl_status.config(
+                text=f"Extraindo autores... {atual / total:.0%}", fg=CORES["texto2"])
+        self.after(0, atualizar)
+
+    def _cb_resultado_autores(self, materias=None, total=0, erro=None):
+        def atualizar():
+            self._buscando = False
+            self._btn_autores.config(text="Extrair Autores", state="normal",
+                                     bg=CORES["painel2"], fg=CORES["texto2"])
+            self._barra.atualizar(1.0 if not erro else 0.0)
+            if erro:
+                self._lbl_status.config(text=f"Erro: {erro}", fg=CORES["vermelho"])
+                self._mostrar_placeholder(self._frame_autores, "autores", erro)
+                return
+            self._lbl_progresso.config(
+                text=f"{total} materia(s) analisada(s)", fg=CORES["texto3"])
+
+            # Separa encontrados vs desconhecidos
+            com_autor = [m for m in materias if m["autor_info"].get("autor")]
+            sem_autor = [m for m in materias if not m["autor_info"].get("autor")]
+
+            self._lbl_status.config(
+                text=f"{len(com_autor)} autor(es) encontrado(s)  |  "
+                     f"{len(sem_autor)} sem autor  |  {total} materia(s)",
+                fg=CORES["verde"] if com_autor else CORES["amarelo"])
+            self._mostrar_autores(materias)
+        self.after(0, atualizar)
+
+    # ── Extração A TARDE ──────────────────────────────────────────────────
+
+    def _iniciar_extracao_atarde(self):
+        """Lê o texto completo do PDF e extrai autores via extrair_autores_ataarde()."""
+        import threading
+
+        pdf = self.caminho_pdf.get() if hasattr(self, "caminho_pdf") else ""
+        if not pdf:
+            from tkinter import messagebox
+            messagebox.showwarning("Atenção", "Selecione um arquivo PDF primeiro.")
+            return
+
+        self._btn_autores_atarde.config(text="Extraindo...", state="disabled")
+        # Navega para a aba de resultado
+        self._abas.select(self._aba_autores_atarde)
+
+        def _run():
+            try:
+                import fitz
+                doc = fitz.open(pdf)
+                texto_completo = "\n".join(
+                    doc[i].get_text("text") or "" for i in range(len(doc))
+                )
+                doc.close()
+                resultado = extrair_autores_ataarde(texto_completo)
+            except Exception as exc:
+                resultado = {"total_autores": 0, "autores_unicos": [],
+                             "por_categoria": {}, "_erro": str(exc)}
+            self.after(0, lambda: self._mostrar_autores_atarde(resultado))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _mostrar_autores_atarde(self, resultado):
+        """Renderiza os resultados de extrair_autores_ataarde() na aba dedicada."""
+        self._btn_autores_atarde.config(text="Autores A TARDE", state="normal")
+        self._limpar_frame(self._frame_autores_atarde)
+
+        erro = resultado.get("_erro")
+        if erro:
+            tk.Label(self._frame_autores_atarde,
+                     text=f"Erro: {erro}",
+                     font=FONTE_LABEL, fg=CORES["vermelho"],
+                     bg=CORES["painel"]).pack(pady=20)
+            return
+
+        total = resultado.get("total_autores", 0)
+        autores_unicos = resultado.get("autores_unicos", [])
+        por_categoria = resultado.get("por_categoria", {})
+
+        # ── Cabeçalho resumo ─────────────────────────────────────────────
+        cab = tk.Frame(self._frame_autores_atarde, bg=CORES["painel2"],
+                       pady=8, padx=12)
+        cab.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Label(cab, text=f"Total de autores identificados: {total}",
+                 font=("Segoe UI", 10, "bold"),
+                 fg=CORES["verde"], bg=CORES["painel2"]).pack(anchor="w")
+
+        # ── Seções por categoria ─────────────────────────────────────────
+        COR_CAT = {
+            "Jornalistas / Redatores": CORES["azul"],
+            "Colunistas":              CORES["lilas"],
+            "Políticos / Opinião":     CORES["amarelo"],
+            "Leitores":                CORES["ciano"],
+        }
+
+        for cat, nomes in por_categoria.items():
+            if not nomes:
+                continue
+            sec = tk.Frame(self._frame_autores_atarde, bg=CORES["painel2"],
+                           pady=8, padx=12)
+            sec.pack(fill="x", padx=8, pady=(0, 6))
+
+            cor = COR_CAT.get(cat, CORES["texto2"])
+            tk.Label(sec, text=f"{cat}  ({len(nomes)})",
+                     font=("Segoe UI", 9, "bold"),
+                     fg=cor, bg=CORES["painel2"]).pack(anchor="w", pady=(0, 4))
+
+            for nome in nomes:
+                tk.Label(sec, text=f"  • {nome}",
+                         font=FONTE_LABEL, fg=CORES["texto"],
+                         bg=CORES["painel2"], anchor="w"
+                         ).pack(fill="x")
+
+        # ── Lista completa (alfabética) ──────────────────────────────────
+        if autores_unicos:
+            sec_todos = tk.Frame(self._frame_autores_atarde, bg=CORES["painel2"],
+                                 pady=8, padx=12)
+            sec_todos.pack(fill="x", padx=8, pady=(0, 6))
+            tk.Label(sec_todos, text=f"Lista completa  ({len(autores_unicos)})",
+                     font=("Segoe UI", 9, "bold"),
+                     fg=CORES["texto2"], bg=CORES["painel2"]).pack(anchor="w", pady=(0, 4))
+            # Exibe em grade de 2 colunas
+            grade = tk.Frame(sec_todos, bg=CORES["painel2"])
+            grade.pack(fill="x")
+            for i, nome in enumerate(autores_unicos):
+                col = i % 2
+                tk.Label(grade, text=f"  {nome}",
+                         font=FONTE_PEQUENA, fg=CORES["texto2"],
+                         bg=CORES["painel2"], anchor="w"
+                         ).grid(row=i // 2, column=col, sticky="w", padx=(0, 20))
+
+    def _montar_aba_buscar_autor(self, parent):
+        """Monta a aba de busca de autores no PDF (3 modos)."""
+        # ── Seletor de modo ───────────────────────────────────────────────
+        topo = tk.Frame(parent, bg=CORES["fundo"])
+        topo.pack(fill="x", padx=16, pady=(14, 4))
+
+        tk.Label(topo, text="Modo de busca:",
+                 font=FONTE_LABEL, fg=CORES["texto2"],
+                 bg=CORES["fundo"]).pack(anchor="w")
+
+        self._modo_busca_autor = tk.StringVar(value="unico")
+        barra_modos = tk.Frame(topo, bg=CORES["fundo"])
+        barra_modos.pack(fill="x", pady=(4, 8))
+        for label, valor in (("Nome único", "unico"),
+                             ("Lista de nomes", "lista"),
+                             ("Arquivo .txt", "arquivo")):
+            tk.Radiobutton(barra_modos, text=label, variable=self._modo_busca_autor,
+                           value=valor, font=FONTE_LABEL,
+                           fg=CORES["texto"], bg=CORES["fundo"],
+                           selectcolor=CORES["painel2"], activebackground=CORES["fundo"],
+                           command=self._alternar_modo_busca_autor
+                           ).pack(side="left", padx=(0, 16))
+
+        # ── Painéis de entrada (um por modo, só um visível por vez) ───────
+        self._paineis_busca_autor = {}
+
+        # Modo 1 — nome único
+        p1 = tk.Frame(topo, bg=CORES["fundo"])
+        linha1 = tk.Frame(p1, bg=CORES["fundo"])
+        linha1.pack(fill="x")
+        self._var_busca_autor = tk.StringVar()
+        entry = tk.Entry(linha1, textvariable=self._var_busca_autor,
+                         font=FONTE_LABEL, bg=CORES["painel2"],
+                         fg=CORES["texto"], insertbackground=CORES["texto"],
+                         relief="flat", bd=0)
+        entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
+        entry.bind("<Return>", lambda e: self._executar_busca_autor())
+        tk.Button(linha1, text="Buscar", font=FONTE_LABEL, bg=CORES["azul"],
+                  fg="white", relief="flat", bd=0, cursor="hand2",
+                  padx=14, pady=4, command=self._executar_busca_autor
+                  ).pack(side="left")
+        self._paineis_busca_autor["unico"] = p1
+
+        # Modo 2 — lista de nomes
+        p2 = tk.Frame(topo, bg=CORES["fundo"])
+        tk.Label(p2, text="Um nome por linha:", font=FONTE_PEQUENA,
+                 fg=CORES["texto3"], bg=CORES["fundo"]).pack(anchor="w")
+        self._txt_lista_nomes = tk.Text(p2, height=5, font=FONTE_LABEL,
+                                        bg=CORES["painel2"], fg=CORES["texto"],
+                                        insertbackground=CORES["texto"],
+                                        relief="flat", bd=0)
+        self._txt_lista_nomes.pack(fill="x", pady=(2, 6))
+        tk.Button(p2, text="Buscar lista", font=FONTE_LABEL, bg=CORES["azul"],
+                  fg="white", relief="flat", bd=0, cursor="hand2",
+                  padx=14, pady=4, command=self._executar_busca_lista
+                  ).pack(anchor="w")
+        self._paineis_busca_autor["lista"] = p2
+
+        # Modo 3 — arquivo .txt
+        p3 = tk.Frame(topo, bg=CORES["fundo"])
+        linha3 = tk.Frame(p3, bg=CORES["fundo"])
+        linha3.pack(fill="x")
+        self._lbl_arquivo_nomes = tk.Label(linha3, text="Nenhum arquivo selecionado",
+                                           font=FONTE_PEQUENA, fg=CORES["texto3"],
+                                           bg=CORES["painel2"], anchor="w",
+                                           padx=8, pady=6)
+        self._lbl_arquivo_nomes.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._caminho_arquivo_nomes = tk.StringVar()
+        tk.Button(linha3, text="Selecionar .txt", font=FONTE_LABEL,
+                  bg=CORES["painel2"], fg=CORES["texto"], relief="flat", bd=0,
+                  cursor="hand2", padx=10, pady=4,
+                  command=self._selecionar_arquivo_nomes).pack(side="left", padx=(0, 8))
+        tk.Button(linha3, text="Buscar arquivo", font=FONTE_LABEL, bg=CORES["azul"],
+                  fg="white", relief="flat", bd=0, cursor="hand2",
+                  padx=14, pady=4, command=self._executar_busca_arquivo
+                  ).pack(side="left")
+        self._paineis_busca_autor["arquivo"] = p3
+
+        # Exibe painel inicial
+        p1.pack(fill="x", pady=(0, 4))
+
+        # ── Status ────────────────────────────────────────────────────────
+        self._lbl_status_busca_autor = tk.Label(
+            topo, text="", font=FONTE_PEQUENA,
+            fg=CORES["texto3"], bg=CORES["fundo"])
+        self._lbl_status_busca_autor.pack(anchor="w", pady=(4, 0))
+
+        # ── Área de resultados (rolável) ──────────────────────────────────
+        self._canvas_busca_autor, self._frame_busca_autor = \
+            self._criar_area_rolavel(parent)
+
+    def _alternar_modo_busca_autor(self):
+        """Troca o painel visível conforme o modo selecionado."""
+        for modo, painel in self._paineis_busca_autor.items():
+            if modo == self._modo_busca_autor.get():
+                painel.pack(fill="x", pady=(0, 4))
+            else:
+                painel.pack_forget()
+
+    def _pdf_carregado(self) -> str:
+        """Retorna o caminho do PDF ou '' se nenhum carregado."""
+        return self.caminho_pdf.get() if hasattr(self, "caminho_pdf") else ""
+
+    def _executar_busca_autor(self):
+        """Modo 1 — busca um único nome."""
+        import threading
+        pdf = self._pdf_carregado()
+        if not pdf:
+            self._lbl_status_busca_autor.config(
+                text="Nenhum PDF carregado.", fg=CORES["amarelo"]); return
+        nome = self._var_busca_autor.get().strip()
+        if not nome:
+            self._lbl_status_busca_autor.config(
+                text="Digite um nome para buscar.", fg=CORES["amarelo"]); return
+        self._lbl_status_busca_autor.config(text="Buscando...", fg=CORES["texto3"])
+        self._limpar_frame(self._frame_busca_autor)
+        def _run():
+            res = buscar_autor_no_pdf(pdf, nome)
+            self.after(0, lambda: self._mostrar_resultados_busca_autor(nome, res))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _executar_busca_lista(self):
+        """Modo 2 — busca lista de nomes digitada no Text widget."""
+        import threading
+        pdf = self._pdf_carregado()
+        if not pdf:
+            self._lbl_status_busca_autor.config(
+                text="Nenhum PDF carregado.", fg=CORES["amarelo"]); return
+        raw = self._txt_lista_nomes.get("1.0", "end")
+        nomes = [l.strip() for l in raw.splitlines() if l.strip() and not l.strip().startswith("#")]
+        if not nomes:
+            self._lbl_status_busca_autor.config(
+                text="Nenhum nome na lista.", fg=CORES["amarelo"]); return
+        self._lbl_status_busca_autor.config(
+            text=f"Buscando {len(nomes)} nome(s)...", fg=CORES["texto3"])
+        self._limpar_frame(self._frame_busca_autor)
+        def _run():
+            res = search_multiple_names(nomes, pdf)
+            self.after(0, lambda: self._mostrar_resultados_multiplos(res))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _selecionar_arquivo_nomes(self):
+        """Abre diálogo para escolher arquivo .txt com nomes."""
+        from tkinter import filedialog
+        caminho = filedialog.askopenfilename(
+            title="Selecionar arquivo de nomes",
+            filetypes=[("Arquivo de texto", "*.txt"), ("Todos", "*.*")])
+        if caminho:
+            self._caminho_arquivo_nomes.set(caminho)
+            self._lbl_arquivo_nomes.config(
+                text=caminho, fg=CORES["texto"])
+
+    def _executar_busca_arquivo(self):
+        """Modo 3 — busca nomes lidos de arquivo .txt."""
+        import threading
+        pdf = self._pdf_carregado()
+        if not pdf:
+            self._lbl_status_busca_autor.config(
+                text="Nenhum PDF carregado.", fg=CORES["amarelo"]); return
+        arq = self._caminho_arquivo_nomes.get()
+        if not arq:
+            self._lbl_status_busca_autor.config(
+                text="Selecione um arquivo .txt primeiro.", fg=CORES["amarelo"]); return
+        try:
+            nomes = load_names_from_txt(arq)
+        except IOError as exc:
+            self._lbl_status_busca_autor.config(text=str(exc), fg=CORES["vermelho"]); return
+        if not nomes:
+            self._lbl_status_busca_autor.config(
+                text="Arquivo sem nomes válidos.", fg=CORES["amarelo"]); return
+        self._lbl_status_busca_autor.config(
+            text=f"Buscando {len(nomes)} nome(s)...", fg=CORES["texto3"])
+        self._limpar_frame(self._frame_busca_autor)
+        def _run():
+            res = search_multiple_names(nomes, pdf)
+            self.after(0, lambda: self._mostrar_resultados_multiplos(res))
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _mostrar_resultados_busca_autor(self, nome, resultados):
+        """Renderiza cards de resultado para busca de nome único."""
+        self._limpar_frame(self._frame_busca_autor)
+        if not resultados:
+            self._lbl_status_busca_autor.config(
+                text=f'Autor "{nome}" não encontrado no PDF.',
+                fg=CORES["amarelo"])
+            tk.Label(self._frame_busca_autor,
+                     text=f'Nenhuma ocorrência de "{nome}" no PDF.',
+                     font=FONTE_LABEL, fg=CORES["texto3"],
+                     bg=CORES["painel"]).pack(pady=40)
+            return
+        paginas_str = ", ".join(str(r["pagina"]) for r in resultados)
+        total_trechos = sum(len(r["trechos"]) for r in resultados)
+        self._lbl_status_busca_autor.config(
+            text=(f'"{nome}" — {len(resultados)} página(s): '
+                  f'{paginas_str}  —  {total_trechos} ocorrência(s)'),
+            fg=CORES["verde"])
+        for item in resultados:
+            card = tk.Frame(self._frame_busca_autor,
+                            bg=CORES["painel2"], pady=10, padx=12)
+            card.pack(fill="x", padx=8, pady=(0, 6))
+            tk.Label(card, text=f"Página {item['pagina']}",
+                     font=FONTE_LABEL, fg=CORES["azul"],
+                     bg=CORES["painel2"]).pack(anchor="w")
+            for trecho in item["trechos"]:
+                tk.Label(card, text=f"  …{trecho}…",
+                         font=FONTE_PEQUENA, fg=CORES["texto2"],
+                         bg=CORES["painel2"], wraplength=700,
+                         justify="left", anchor="w").pack(fill="x", pady=(2, 0))
+
+    def _mostrar_resultados_multiplos(self, resultados: dict):
+        """Renderiza tabela resumo + cards para busca de múltiplos nomes."""
+        self._limpar_frame(self._frame_busca_autor)
+        encontrados = {n: p for n, p in resultados.items() if p}
+        nao_encontrados = [n for n, p in resultados.items() if not p]
+        total = len(resultados)
+        self._lbl_status_busca_autor.config(
+            text=(f"{len(encontrados)}/{total} nome(s) encontrado(s)"),
+            fg=CORES["verde"] if encontrados else CORES["amarelo"])
+
+        # ── Tabela resumo ────────────────────────────────────────────────
+        tabela = tk.Frame(self._frame_busca_autor, bg=CORES["painel2"],
+                          pady=8, padx=12)
+        tabela.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Label(tabela, text="RESUMO", font=("Segoe UI", 9, "bold"),
+                 fg=CORES["texto2"], bg=CORES["painel2"]).pack(anchor="w", pady=(0, 4))
+        for nome, paginas in resultados.items():
+            linha = tk.Frame(tabela, bg=CORES["painel2"])
+            linha.pack(fill="x", pady=1)
+            if paginas:
+                pags_str = ", ".join(str(p) for p in paginas)
+                info = f"Encontrado  —  página(s): {pags_str}"
+                cor = CORES["verde"]
+            else:
+                info = "Não encontrado"
+                cor = CORES["texto3"]
+            tk.Label(linha, text=f"  {nome}", font=FONTE_LABEL,
+                     fg=CORES["texto"], bg=CORES["painel2"],
+                     width=28, anchor="w").pack(side="left")
+            tk.Label(linha, text=info, font=FONTE_PEQUENA,
+                     fg=cor, bg=CORES["painel2"],
+                     anchor="w").pack(side="left", fill="x", expand=True)
+
+        # ── Cards detalhados apenas para os encontrados ──────────────────
+        for nome, paginas in encontrados.items():
+            ocorrencias = buscar_autor_no_pdf(self._pdf_carregado(), nome)
+            card = tk.Frame(self._frame_busca_autor,
+                            bg=CORES["painel2"], pady=10, padx=12)
+            card.pack(fill="x", padx=8, pady=(0, 6))
+            tk.Label(card, text=nome, font=FONTE_LABEL,
+                     fg=CORES["azul"], bg=CORES["painel2"]).pack(anchor="w")
+            for item in ocorrencias:
+                tk.Label(card, text=f"  Página {item['pagina']}",
+                         font=("Segoe UI", 8, "bold"), fg=CORES["texto2"],
+                         bg=CORES["painel2"]).pack(anchor="w", pady=(4, 0))
+                for trecho in item["trechos"]:
+                    tk.Label(card, text=f"    …{trecho}…",
+                             font=FONTE_PEQUENA, fg=CORES["texto2"],
+                             bg=CORES["painel2"], wraplength=680,
+                             justify="left", anchor="w").pack(fill="x", pady=(1, 0))
+
+    def _mostrar_autores(self, materias):
+        self._limpar_frame(self._frame_autores)
+
+        com_autor = [m for m in materias if m["autor_info"].get("autor")]
+        sem_autor = [m for m in materias if not m["autor_info"].get("autor")]
+
+        # Resumo no topo
+        resumo = tk.Frame(self._frame_autores, bg=CORES["painel2"])
+        resumo.pack(fill="x", pady=(0, 4))
+        tk.Label(resumo,
+                 text=f"  {len(com_autor)} autor(es) identificado(s)  |  "
+                      f"{len(sem_autor)} sem autor",
+                 font=("Segoe UI", 9, "bold"),
+                 fg=CORES["verde"], bg=CORES["painel2"], pady=8).pack(side="left")
+
+        # Agrupamento por autor
+        autores_agrupados = {}
+        for m in com_autor:
+            nome = m["autor_info"]["autor"]
+            autores_agrupados.setdefault(nome, []).append(m)
+
+        # Tabela-resumo de autores
+        if autores_agrupados:
+            frame_tabela = tk.Frame(self._frame_autores, bg=CORES["painel3"],
+                                    highlightbackground=CORES["borda"],
+                                    highlightthickness=1)
+            frame_tabela.pack(fill="x", padx=8, pady=(4, 8))
+
+            tk.Label(frame_tabela, text="  RESUMO POR AUTOR",
+                     font=("Segoe UI", 9, "bold"),
+                     fg=CORES["lilas"], bg=CORES["painel3"],
+                     pady=6).pack(anchor="w")
+
+            for nome, lista in sorted(autores_agrupados.items(),
+                                       key=lambda x: len(x[1]), reverse=True):
+                tipo = lista[0]["autor_info"]["tipo"]
+                tipo_map = {"reporter": "Reporter", "redacao": "Redacao",
+                            "articulista": "Articulista", "desconhecido": ""}
+                tipo_label = tipo_map.get(tipo, tipo)
+                paginas = sorted(set(m["pagina"] for m in lista))
+                pags_str = ", ".join(str(p) for p in paginas)
+
+                lr = tk.Frame(frame_tabela, bg=CORES["painel3"])
+                lr.pack(fill="x", padx=8, pady=2)
+                tk.Label(lr, text=f"{nome}",
+                         font=("Consolas", 9, "bold"),
+                         fg=CORES["texto"], bg=CORES["painel3"],
+                         anchor="w").pack(side="left")
+                tk.Label(lr, text=f"  ({tipo_label})",
+                         font=FONTE_BADGE, fg=CORES["ciano"],
+                         bg=CORES["painel3"]).pack(side="left")
+                tk.Label(lr, text=f"  {len(lista)}x  |  Pag: {pags_str}",
+                         font=FONTE_MONO_P, fg=CORES["texto2"],
+                         bg=CORES["painel3"]).pack(side="left", padx=(6, 0))
+
+                # Colaboradores
+                for m in lista:
+                    colabs = m["autor_info"].get("colaboradores", [])
+                    if colabs:
+                        tk.Label(lr,
+                                 text=f"  + {', '.join(colabs)}",
+                                 font=FONTE_MONO_P, fg=CORES["amarelo"],
+                                 bg=CORES["painel3"]).pack(side="left")
+                        break
+
+            tk.Frame(frame_tabela, bg=CORES["borda"], height=1).pack(
+                fill="x", padx=8, pady=(4, 6))
+
+        # Cards detalhados de cada matéria
+        for m in materias:
+            self._card_autor(m)
+
+    def _card_autor(self, dados):
+        ai = dados["autor_info"]
+        tem_autor = ai.get("autor") is not None
+
+        card = tk.Frame(self._frame_autores, bg=CORES["painel2"],
+                        highlightbackground=CORES["borda"], highlightthickness=1)
+        card.pack(fill="x", padx=8, pady=3)
+
+        # Linha topo: página + autor
+        topo = tk.Frame(card, bg=CORES["painel2"])
+        topo.pack(fill="x", padx=10, pady=(8, 4))
+
+        tk.Label(topo, text=f"Pag. {dados['pagina']}",
+                 font=("Segoe UI", 10, "bold"),
+                 fg=CORES["texto"], bg=CORES["painel2"]).pack(side="left")
+
+        if tem_autor:
+            tipo_map = {"reporter": "Reporter", "redacao": "Redacao",
+                        "articulista": "Articulista", "desconhecido": ""}
+            tipo_label = tipo_map.get(ai["tipo"], "")
+            confianca = ai.get("confianca", 0)
+            cor_conf = (CORES["verde"] if confianca >= 0.85
+                        else CORES["amarelo"] if confianca >= 0.65
+                        else CORES["texto2"])
+
+            tk.Label(topo, text=f"  {ai['autor']}",
+                     font=("Consolas", 10, "bold"),
+                     fg=cor_conf, bg=CORES["painel2"]).pack(side="left")
+            tk.Label(topo, text=f"  {tipo_label}  {confianca:.0%}",
+                     font=FONTE_BADGE, fg=CORES["texto2"],
+                     bg=CORES["painel3"], padx=4).pack(side="left", padx=(4, 0))
+
+            if ai.get("colaboradores"):
+                tk.Label(topo, text=f"  + {', '.join(ai['colaboradores'])}",
+                         font=FONTE_BADGE, fg=CORES["amarelo"],
+                         bg=CORES["painel2"]).pack(side="left", padx=(6, 0))
+        else:
+            tk.Label(topo, text="  Autor nao identificado",
+                     font=FONTE_BADGE, fg=CORES["texto3"],
+                     bg=CORES["painel2"]).pack(side="left")
+
+        # Preview da região
+        preview = gerar_preview_anuncio(
+            self.caminho_pdf.get(), dados["pagina"],
+            dados["x_cm"], dados["y_cm"],
+            dados["w_cm"], dados["h_cm"],
+            largura_thumb=300)
+        if preview:
+            try:
+                foto = ImageTk.PhotoImage(preview)
+                self._thumbnails.append(foto)
+                tk.Label(card, image=foto,
+                         bg=CORES["painel2"]).pack(padx=10, pady=(2, 4))
+            except Exception:
+                pass
+
+        # Trecho de texto
+        if dados.get("trecho"):
+            txt_frame = tk.Frame(card, bg=CORES["painel3"],
+                                 highlightbackground=CORES["borda"],
+                                 highlightthickness=1)
+            txt_frame.pack(fill="x", padx=10, pady=(0, 4))
+            tk.Label(txt_frame, text=dados["trecho"],
+                     font=FONTE_MONO_P, fg=CORES["texto2"],
+                     bg=CORES["painel3"], anchor="w",
+                     justify="left", wraplength=500,
+                     padx=6, pady=4).pack(fill="x")
+
+        # Métricas de posição
+        metricas = tk.Frame(card, bg=CORES["painel2"])
+        metricas.pack(fill="x", padx=10, pady=(0, 2))
+
+        def ml(tag, cor, val):
+            l = tk.Frame(metricas, bg=CORES["painel2"])
+            l.pack(fill="x", pady=1)
+            tk.Label(l, text=tag, font=FONTE_BADGE,
+                     fg=cor, bg=CORES["painel3"], padx=2).pack(side="left")
+            tk.Label(l, text=val, font=FONTE_MONO_P,
+                     fg=CORES["texto2"], bg=CORES["painel2"],
+                     padx=6).pack(side="left")
+
+        ml(" POS  ", CORES["amarelo"],
+           f"X {dados['x_cm']:.3f} cm  Y {dados['y_cm']:.3f} cm")
+        ml(" TAM  ", CORES["ciano"],
+           f"L {dados['w_cm']:.3f} cm  x  A {dados['h_cm']:.3f} cm")
+
+        # Colunagem
+        nome_jornal = self.jornal_ativo.get()
+        jornal = JORNAIS_CADASTRADOS.get(nome_jornal)
+        if jornal and dados["w_cm"] and dados["h_cm"]:
+            info = calcular_info_colunas(
+                dados["w_cm"], dados.get("x_cm") or 0.0, jornal)
+            sinal = "+" if info["desvio"] >= 0 else ""
+            ml(" COL  ", CORES["lilas"],
+               f"Col {info['col_ini']} a {info['col_fim']}  "
+               f"|  {info['num_col']} col ({info['cols_exato']:.3f})  "
+               f"|  alt {dados['h_cm']:.3f} cm")
+            ml(" DIM  ", CORES["ciano"],
+               f"Padrao {info['larg_padrao']:.3f} cm  "
+               f"|  Medido {dados['w_cm']:.3f} cm  "
+               f"|  Δ {sinal}{info['desvio']:.3f} cm")
+
+        if ai.get("raw_autor_linha"):
+            ml("LINHA", CORES["texto3"],
+               f"\"{ai['raw_autor_linha']}\"")
+
+        # Botão de marcar no PDF
+        tk.Button(card,
+            text="Baixar PDF com marcacao",
+            font=("Segoe UI", 8, "bold"),
+            fg="#ffffff", bg=CORES["verde"],
+            activebackground="#22a870",
+            activeforeground="#ffffff",
+            relief="flat", cursor="hand2",
+            padx=8, pady=5,
+            command=lambda d=dados: self._baixar_pdf_marcado([d])
+        ).pack(fill="x", padx=10, pady=(4, 8))
 
 
 if __name__ == "__main__":
