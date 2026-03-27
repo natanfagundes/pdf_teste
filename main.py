@@ -1060,7 +1060,7 @@ class AutorConfig:
 
 
 # Instância padrão (usada quando nenhuma config é passada)
-_cfg_padrao = AutorConfig()
+_cfg_padrao = AutorConfig() 
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2615,14 +2615,32 @@ class BotaoArquivo(tk.Label):
 
 class BarraProgresso(tk.Canvas):
     def __init__(self, parent, **kw):
-        super().__init__(parent, height=8, bg=CORES["fundo"],
+        super().__init__(parent, height=6, bg=CORES["fundo"],
                          highlightthickness=0, **kw)
         self._porcentagem = 0.0
+        self._animando    = False
+        self._pulso_x     = 0
+        self._job         = None
         self.bind("<Configure>", self._desenhar)
 
     def atualizar(self, valor):
         self._porcentagem = max(0.0, min(1.0, valor))
+        if valor <= 0.0 or valor >= 1.0:
+            self._animando = False
+            if self._job:
+                self.after_cancel(self._job)
+                self._job = None
+        elif not self._animando:
+            self._animando = True
+            self._animar()
         self._desenhar()
+
+    def _animar(self):
+        if not self._animando:
+            return
+        self._pulso_x = (self._pulso_x + 3) % max(1, self.winfo_width())
+        self._desenhar()
+        self._job = self.after(30, self._animar)
 
     def _desenhar(self, event=None):
         self.delete("all")
@@ -2630,10 +2648,12 @@ class BarraProgresso(tk.Canvas):
         h = self.winfo_height()
         if w < 2:
             return
+        # Fundo com bordas arredondadas simuladas
         self.create_rectangle(0, 0, w, h, fill=CORES["barra_fundo"], outline="")
         preenchido = int(w * self._porcentagem)
         if preenchido > 0:
-            passos = max(1, preenchido // 4)
+            # Gradiente azul → roxo
+            passos = max(1, preenchido // 2)
             for i in range(passos):
                 x0 = int(preenchido * i / passos)
                 x1 = int(preenchido * (i + 1) / passos) + 1
@@ -2642,6 +2662,28 @@ class BarraProgresso(tk.Canvas):
                 g  = int(0x8e + (0x6a - 0x8e) * t)
                 self.create_rectangle(x0, 0, x1, h,
                                       fill=f"#{r:02x}{g:02x}f7", outline="")
+            # Pulso brilhante (shimmer) enquanto animando
+            if self._animando and preenchido > 10:
+                px = self._pulso_x % preenchido
+                brilho_w = max(20, preenchido // 5)
+                for di in range(brilho_w):
+                    alpha = 1.0 - abs(di - brilho_w // 2) / (brilho_w // 2)
+                    bx = (px + di) % preenchido
+                    bval = int(255 * alpha * 0.35)
+                    self.create_rectangle(
+                        bx, 0, bx + 1, h,
+                        fill=f"#{min(255,0x4f+bval):02x}"
+                             f"{min(255,0x8e+bval):02x}"
+                             f"{min(255,0xf7+bval):02x}",
+                        outline="")
+
+
+def _btn_hover(btn, cor_normal, cor_hover, fg_normal="#ffffff", fg_hover="#ffffff"):
+    """Adiciona efeito hover suave a um botao tk.Button."""
+    btn.bind("<Enter>",    lambda e: btn.config(bg=cor_hover,  fg=fg_hover))
+    btn.bind("<Leave>",    lambda e: btn.config(bg=cor_normal, fg=fg_normal))
+    btn.bind("<Button-1>", lambda e: btn.config(bg=CORES["roxo"]))
+    btn.bind("<ButtonRelease-1>", lambda e: btn.config(bg=cor_hover))
 
 
 def criar_barra_score(parent, score):
@@ -2773,9 +2815,9 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("PDF Image Finder - Jornais")
-        self.geometry("1020x760")
-        self.minsize(820, 600)
+        self.title("Dimensao Anuncio")
+        self.geometry("1080x780")
+        self.minsize(860, 620)
         self.configure(bg=CORES["fundo"])
 
         self.caminho_pdf    = tk.StringVar()
@@ -2792,23 +2834,54 @@ class App(tk.Tk):
         self._thumbnails    = []
 
         self._painel_esq = None
+        self._toast_job   = None
         self._montar_interface()
         self._centralizar_janela()
 
     def _montar_interface(self):
-        cabecalho = tk.Frame(self, bg=CORES["fundo"])
-        cabecalho.pack(fill="x", padx=24, pady=(18, 0))
-        tk.Label(cabecalho, text="PDF Image Finder",
-                 font=("Segoe UI", 18, "bold"),
-                 fg=CORES["texto"], bg=CORES["fundo"]).pack(side="left")
-        tk.Label(cabecalho, text="Medicao de anuncios para jornais impressos",
-                 font=FONTE_PEQUENA, fg=CORES["texto2"],
-                 bg=CORES["fundo"]).pack(side="left", padx=(12, 0), pady=(4, 0))
+        # ── Header premium ─────────────────────────────────────────────────
+        header = tk.Frame(self, bg=CORES["painel"],
+                          highlightbackground=CORES["borda"], highlightthickness=1)
+        header.pack(fill="x")
 
-        tk.Frame(self, bg=CORES["borda"], height=1).pack(fill="x", padx=24, pady=(10, 0))
+        inner_h = tk.Frame(header, bg=CORES["painel"])
+        inner_h.pack(fill="x", padx=24, pady=12)
+
+        # Ícone + título
+        col_ico = tk.Frame(inner_h, bg=CORES["painel"])
+        col_ico.pack(side="left")
+        tk.Label(col_ico,
+                 text="▣",
+                 font=("Segoe UI", 26),
+                 fg=CORES["azul"], bg=CORES["painel"]).pack(side="left", padx=(0, 10))
+
+        col_txt = tk.Frame(inner_h, bg=CORES["painel"])
+        col_txt.pack(side="left")
+        tk.Label(col_txt,
+                 text="Dimensão Anuncio",
+                 font=("Segoe UI", 17, "bold"),
+                 fg=CORES["texto"], bg=CORES["painel"]).pack(anchor="w")
+        tk.Label(col_txt,
+                 text="Medição de anúncios para jornais impressos",
+                 font=("Segoe UI", 9),
+                 fg=CORES["texto2"], bg=CORES["painel"]).pack(anchor="w")
+
+        # Badge de versão
+        tk.Label(inner_h,
+                 text=" v2.0 ",
+                 font=("Segoe UI", 8, "bold"),
+                 fg=CORES["azul"], bg=CORES["painel3"],
+                 padx=4, pady=2).pack(side="right", anchor="n")
+
+        # ── Toast de notificação (overlay flutuante) ────────────────────────
+        self._toast = tk.Label(self,
+            text="", font=("Segoe UI", 10, "bold"),
+            fg="#ffffff", bg=CORES["roxo"],
+            padx=18, pady=8)
+        # Não faz pack — é posicionado via place quando necessário
 
         corpo = tk.Frame(self, bg=CORES["fundo"])
-        corpo.pack(fill="both", expand=True, padx=24, pady=10)
+        corpo.pack(fill="both", expand=True, padx=20, pady=10)
 
         # Painel esquerdo com scroll de mouse
         _esq_outer = tk.Frame(corpo, bg=CORES["fundo"], width=390)
@@ -3023,45 +3096,66 @@ class App(tk.Tk):
 
         tk.Frame(parent, bg=CORES["borda"], height=1).pack(fill="x", pady=(8, 8))
 
-        self._btn_buscar = tk.Button(parent, text="Iniciar Busca",
+        self._btn_buscar = tk.Button(parent, text="▶  Iniciar Busca",
             font=("Segoe UI", 11, "bold"), fg="#ffffff", bg=CORES["azul"],
             activebackground=CORES["roxo"], activeforeground="#ffffff",
-            relief="flat", cursor="hand2", pady=9,
+            relief="flat", cursor="hand2", pady=10,
             command=self._iniciar_busca)
         self._btn_buscar.pack(fill="x", pady=(0, 5))
+        _btn_hover(self._btn_buscar, CORES["azul"], CORES["roxo"])
 
-        self._btn_listar = tk.Button(parent, text="Listar Todos os Anuncios",
+        self._btn_listar = tk.Button(parent, text="☰  Listar Todos os Anuncios",
             font=("Segoe UI", 9, "bold"), fg=CORES["texto2"], bg=CORES["painel2"],
             activebackground=CORES["painel3"], activeforeground=CORES["ciano"],
             relief="flat", cursor="hand2", pady=7,
             command=self._iniciar_listagem)
         self._btn_listar.pack(fill="x", pady=(0, 5))
+        _btn_hover(self._btn_listar, CORES["painel2"], CORES["painel3"],
+                   CORES["texto2"], CORES["ciano"])
 
-        self._btn_autores = tk.Button(parent, text="Extrair Autores",
+        self._btn_autores = tk.Button(parent, text="✎  Extrair Autores",
             font=("Segoe UI", 9, "bold"), fg=CORES["texto2"], bg=CORES["painel2"],
             activebackground=CORES["painel3"], activeforeground=CORES["lilas"],
             relief="flat", cursor="hand2", pady=7,
             command=self._iniciar_extracao_autores)
         self._btn_autores.pack(fill="x", pady=(0, 5))
+        _btn_hover(self._btn_autores, CORES["painel2"], CORES["painel3"],
+                   CORES["texto2"], CORES["lilas"])
 
-        self._btn_autores_atarde = tk.Button(parent, text="Autores A TARDE",
+        self._btn_autores_atarde = tk.Button(parent, text="⬛  Autores A TARDE",
             font=("Segoe UI", 9, "bold"), fg=CORES["texto2"], bg=CORES["painel2"],
             activebackground=CORES["painel3"], activeforeground=CORES["ciano"],
             relief="flat", cursor="hand2", pady=7,
             command=self._iniciar_extracao_atarde)
         self._btn_autores_atarde.pack(fill="x")
+        _btn_hover(self._btn_autores_atarde, CORES["painel2"], CORES["painel3"],
+                   CORES["texto2"], CORES["ciano"])
 
     def _montar_painel_direito(self, parent):
-        self._lbl_status = tk.Label(parent, text="Aguardando...",
-            font=FONTE_LABEL, fg=CORES["texto3"], bg=CORES["fundo"], anchor="w")
-        self._lbl_status.pack(fill="x", pady=(0, 4))
+        # ── Status bar ─────────────────────────────────────────────────────
+        status_bar = tk.Frame(parent, bg=CORES["painel2"],
+                              highlightbackground=CORES["borda"], highlightthickness=1)
+        status_bar.pack(fill="x", pady=(0, 6))
+
+        self._lbl_status_ico = tk.Label(status_bar,
+            text="◌", font=("Segoe UI", 11),
+            fg=CORES["texto3"], bg=CORES["painel2"], padx=8)
+        self._lbl_status_ico.pack(side="left")
+
+        self._lbl_status = tk.Label(status_bar,
+            text="Aguardando...",
+            font=("Segoe UI", 9), fg=CORES["texto3"],
+            bg=CORES["painel2"], anchor="w")
+        self._lbl_status.pack(side="left", fill="x", expand=True, pady=6)
+
+        self._lbl_progresso = tk.Label(status_bar,
+            text="", font=FONTE_PEQUENA,
+            fg=CORES["texto3"], bg=CORES["painel2"],
+            anchor="e", padx=8)
+        self._lbl_progresso.pack(side="right")
 
         self._barra = BarraProgresso(parent)
-        self._barra.pack(fill="x", pady=(0, 2))
-
-        self._lbl_progresso = tk.Label(parent, text="", font=FONTE_PEQUENA,
-                                        fg=CORES["texto3"], bg=CORES["fundo"], anchor="w")
-        self._lbl_progresso.pack(fill="x", pady=(0, 6))
+        self._barra.pack(fill="x", pady=(0, 8))
 
         estilo_abas = ttk.Style()
         estilo_abas.configure("Escuro.TNotebook",
@@ -3174,12 +3268,12 @@ class App(tk.Tk):
                       text=f"{float(v):.0%}")
                   ).pack(side="left", fill="x", expand=True, padx=(8, 4))
 
-        tk.Button(topo, text="Buscar texto no PDF",
+        tk.Button(topo, text="▶  Buscar texto no PDF",
             font=("Segoe UI", 11, "bold"),
             fg="#ffffff", bg=CORES["azul"],
             activebackground=CORES["roxo"],
             activeforeground="#ffffff",
-            relief="flat", cursor="hand2", pady=9,
+            relief="flat", cursor="hand2", pady=10,
             command=self._iniciar_busca_texto
         ).pack(fill="x", pady=(12, 0))
 
@@ -3457,6 +3551,7 @@ class App(tk.Tk):
 
         try:
             gerar_pdf_marcado(pdf, marcacoes_validas, destino)
+            self._mostrar_toast("✓  PDF salvo com marcação!", CORES["verde"], 3000)
             messagebox.showinfo("Sucesso",
                 f"PDF salvo com marcacao em:\n{destino}")
         except Exception as e:
@@ -3480,10 +3575,29 @@ class App(tk.Tk):
             lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
         return canvas, frame_interno
 
+    def _mostrar_toast(self, msg, cor=None, duracao=2500):
+        """Exibe notificacao flutuante no canto inferior direito por `duracao` ms."""
+        if self._toast_job:
+            self.after_cancel(self._toast_job)
+        bg = cor or CORES["roxo"]
+        self._toast.config(text=f"  {msg}  ", bg=bg)
+        self._toast.place(relx=1.0, rely=1.0, anchor="se", x=-16, y=-16)
+        self._toast.lift()
+        self._toast_job = self.after(duracao, self._esconder_toast)
+
+    def _esconder_toast(self):
+        self._toast.place_forget()
+        self._toast_job = None
+
     def _titulo_secao(self, parent, texto):
-        tk.Label(parent, text=texto, font=("Segoe UI", 8, "bold"),
+        f = tk.Frame(parent, bg=CORES["fundo"])
+        f.pack(fill="x", pady=(8, 4))
+        tk.Label(f, text=texto,
+                 font=("Segoe UI", 7, "bold"),
                  fg=CORES["azul"], bg=CORES["fundo"],
-                 anchor="w").pack(fill="x", pady=(2, 5))
+                 padx=0).pack(side="left")
+        tk.Frame(f, bg=CORES["borda"], height=1).pack(
+            side="left", fill="x", expand=True, padx=(6, 0), pady=4)
 
     def _estilizar_radio(self, botao):
         def atualizar(*_):
@@ -3705,11 +3819,12 @@ class App(tk.Tk):
                 return
 
         self._buscando = True
-        self._btn_buscar.config(text="Analisando...", state="disabled",
+        self._btn_buscar.config(text="⏳  Analisando...", state="disabled",
                                 bg=CORES["painel2"], fg=CORES["texto2"])
         self._limpar_frame(self._frame_busca)
         self._barra.atualizar(0)
         self._lbl_status.config(text="Analisando...", fg=CORES["texto2"])
+        self._lbl_status_ico.config(text="⟳", fg=CORES["amarelo"])
         self._abas.select(self._aba_busca)
         threading.Thread(
             target=buscar_imagem_no_pdf,
@@ -3729,11 +3844,12 @@ class App(tk.Tk):
             messagebox.showerror("Erro", f"Arquivo nao encontrado:\n{pdf}")
             return
         self._buscando = True
-        self._btn_listar.config(text="Escaneando...", state="disabled",
+        self._btn_listar.config(text="⏳  Escaneando...", state="disabled",
                                 bg=CORES["painel2"], fg=CORES["texto3"])
         self._limpar_frame(self._frame_lista)
         self._barra.atualizar(0)
         self._lbl_status.config(text="Escaneando o PDF...", fg=CORES["texto2"])
+        self._lbl_status_ico.config(text="⟳", fg=CORES["amarelo"])
         self._abas.select(self._aba_lista)
         threading.Thread(
             target=listar_todos_anuncios,
@@ -3745,57 +3861,73 @@ class App(tk.Tk):
         def atualizar():
             self._barra.atualizar(atual / total)
             self._lbl_progresso.config(
-                text=f"Item {atual}/{total}  Pagina {pagina}",
+                text=f"Pág {pagina}  ·  {atual}/{total}",
                 fg=CORES["texto3"])
             self._lbl_status.config(
-                text=f"Processando... {atual / total:.0%}",
+                text=f"Processando...  {atual / total:.0%}",
                 fg=CORES["texto2"])
+            self._lbl_status_ico.config(text="⟳", fg=CORES["amarelo"])
         self.after(0, atualizar)
 
     def _cb_resultado_busca(self, matches=None, melhor_score=0.0, total=0, erro=None):
         def atualizar():
             self._buscando = False
-            self._btn_buscar.config(text="Iniciar Busca", state="normal",
+            self._btn_buscar.config(text="▶  Iniciar Busca", state="normal",
                                     bg=CORES["azul"], fg="#ffffff")
             self._barra.atualizar(1.0 if not erro else 0.0)
             if erro:
                 self._lbl_status.config(text=f"Erro: {erro}", fg=CORES["vermelho"])
+                self._lbl_status_ico.config(text="✕", fg=CORES["vermelho"])
                 self._mostrar_placeholder(self._frame_busca, "busca", erro)
+                self._mostrar_toast(f"Erro: {erro}", CORES["vermelho"])
                 return
             self._lbl_progresso.config(
-                text=f"{total} item(ns) analisado(s)", fg=CORES["texto3"])
+                text=f"{total} página(s) analisada(s)", fg=CORES["texto3"])
             if matches:
                 paginas = sorted(set(m["pagina"] for m in matches))
                 self._lbl_status.config(
-                    text=f"Encontrado em {len(paginas)} pagina(s): "
+                    text=f"Encontrado em {len(paginas)} página(s): "
                          f"{', '.join(map(str, paginas))}",
                     fg=CORES["verde"])
+                self._lbl_status_ico.config(text="✔", fg=CORES["verde"])
                 self._mostrar_matches(matches)
+                self._mostrar_toast(
+                    f"✔  Encontrado em {len(paginas)} página(s)",
+                    CORES["verde"], 3000)
             else:
                 self._lbl_status.config(
-                    text=f"Nao encontrado  "
+                    text=f"Não encontrado  "
                          f"(melhor: {melhor_score:.1%}  "
                          f"limiar: {self.limiar.get():.0%})",
                     fg=CORES["vermelho"])
+                self._lbl_status_ico.config(text="✕", fg=CORES["vermelho"])
                 self._mostrar_nao_encontrado(melhor_score)
+                self._mostrar_toast(
+                    f"Não encontrado  ·  melhor: {melhor_score:.1%}",
+                    CORES["vermelho"], 3500)
         self.after(0, atualizar)
 
     def _cb_resultado_listagem(self, imagens=None, total=0, erro=None):
         def atualizar():
             self._buscando = False
-            self._btn_listar.config(text="Listar Todos os Anuncios",
+            self._btn_listar.config(text="☰  Listar Todos os Anuncios",
                                     state="normal",
                                     bg=CORES["painel2"], fg=CORES["texto2"])
             self._barra.atualizar(1.0 if not erro else 0.0)
             if erro:
                 self._lbl_status.config(text=f"Erro: {erro}", fg=CORES["vermelho"])
+                self._lbl_status_ico.config(text="✕", fg=CORES["vermelho"])
                 self._mostrar_placeholder(self._frame_lista, "lista", erro)
+                self._mostrar_toast(f"Erro: {erro}", CORES["vermelho"])
                 return
             self._lbl_progresso.config(
-                text=f"{total} item(ns) encontrado(s)", fg=CORES["texto3"])
+                text=f"{total} anúncio(s) encontrado(s)", fg=CORES["texto3"])
             self._lbl_status.config(
-                text=f"{total} anuncio(s) listado(s)", fg=CORES["ciano"])
+                text=f"{total} anúncio(s) listado(s)", fg=CORES["ciano"])
+            self._lbl_status_ico.config(text="✔", fg=CORES["ciano"])
             self._mostrar_todos(imagens)
+            self._mostrar_toast(f"☰  {total} anúncio(s) listado(s)",
+                                CORES["ciano"], 2500)
         self.after(0, atualizar)
 
     def _limpar_frame(self, frame):
@@ -3823,41 +3955,91 @@ class App(tk.Tk):
     def _mostrar_nao_encontrado(self, melhor_score):
         self._limpar_frame(self._frame_busca)
         f = tk.Frame(self._frame_busca, bg=CORES["painel"])
-        f.pack(fill="both", expand=True, padx=16, pady=24)
-        tk.Label(f, text="X", font=("Segoe UI", 36),
+        f.pack(fill="both", expand=True, padx=16, pady=32)
+        tk.Label(f, text="✕",
+                 font=("Segoe UI", 42),
                  fg=CORES["vermelho"], bg=CORES["painel"]).pack()
-        tk.Label(f, text="Anuncio nao encontrado",
-                 font=("Segoe UI", 13, "bold"),
+        tk.Label(f, text="Anúncio não encontrado",
+                 font=("Segoe UI", 14, "bold"),
                  fg=CORES["texto"], bg=CORES["painel"]).pack(pady=(4, 0))
-        tk.Label(f, text=f"Maior similaridade: {melhor_score:.1%}\n"
-                          "Tente reduzir o limiar de sensibilidade.",
+        barra_pct = tk.Frame(f, bg=CORES["painel"])
+        barra_pct.pack(pady=(16, 0))
+        cor_m = (CORES["verde"] if melhor_score >= 0.75
+                 else CORES["amarelo"] if melhor_score >= 0.50
+                 else CORES["vermelho"])
+        tk.Label(barra_pct,
+                 text=f"Maior similaridade encontrada: ",
                  font=FONTE_PEQUENA, fg=CORES["texto2"],
-                 bg=CORES["painel"], justify="center").pack(pady=(6, 0))
+                 bg=CORES["painel"]).pack(side="left")
+        tk.Label(barra_pct,
+                 text=f"{melhor_score:.1%}",
+                 font=("Segoe UI", 11, "bold"),
+                 fg=cor_m, bg=CORES["painel"]).pack(side="left")
+        tk.Label(f,
+                 text="Tente reduzir o limiar de sensibilidade ou use outra imagem.",
+                 font=FONTE_PEQUENA, fg=CORES["texto2"],
+                 bg=CORES["painel"], justify="center").pack(pady=(8, 0))
 
     def _mostrar_matches(self, matches):
         self._limpar_frame(self._frame_busca)
-        cab = tk.Frame(self._frame_busca, bg=CORES["painel2"])
+        cab = tk.Frame(self._frame_busca, bg=CORES["painel3"])
         cab.pack(fill="x")
-        tk.Label(cab, text=f"  {len(matches)} correspondencia(s) encontrada(s)",
+        tk.Label(cab,
+                 text=f"  ✔  {len(matches)} correspondência(s) encontrada(s)",
                  font=("Segoe UI", 9, "bold"),
-                 fg=CORES["verde"], bg=CORES["painel2"], pady=8).pack(side="left")
+                 fg=CORES["verde"], bg=CORES["painel3"], pady=9).pack(side="left")
         for match in sorted(matches, key=lambda x: x["score"], reverse=True):
             self._criar_card(self._frame_busca, match, eh_match=True)
 
     def _mostrar_todos(self, imagens):
         self._limpar_frame(self._frame_lista)
-        cab = tk.Frame(self._frame_lista, bg=CORES["painel2"])
+        cab = tk.Frame(self._frame_lista, bg=CORES["painel3"])
         cab.pack(fill="x")
-        tk.Label(cab, text=f"  {len(imagens)} anuncio(s) no PDF",
+        tk.Label(cab,
+                 text=f"  ☰  {len(imagens)} anúncio(s) no PDF",
                  font=("Segoe UI", 9, "bold"),
-                 fg=CORES["ciano"], bg=CORES["painel2"], pady=8).pack(side="left")
+                 fg=CORES["ciano"], bg=CORES["painel3"], pady=9).pack(side="left")
         for info_img in imagens:
             self._criar_card(self._frame_lista, info_img, eh_match=False)
 
     def _criar_card(self, parent, dados, eh_match):
-        card = tk.Frame(parent, bg=CORES["painel2"],
-                        highlightbackground=CORES["borda"], highlightthickness=1)
-        card.pack(fill="x", padx=8, pady=4)
+        # Card com borda esquerda colorida e hover highlight
+        cor_borda = (CORES["verde"] if eh_match and dados.get("score", 0) >= 0.85
+                     else CORES["amarelo"] if eh_match and dados.get("score", 0) >= 0.65
+                     else CORES["azul"] if eh_match
+                     else CORES["borda"])
+
+        outer = tk.Frame(parent, bg=CORES["painel2"],
+                         highlightbackground=CORES["borda"], highlightthickness=1)
+        outer.pack(fill="x", padx=8, pady=4)
+
+        # Barra lateral colorida
+        tk.Frame(outer, bg=cor_borda, width=4).pack(side="left", fill="y")
+
+        card = tk.Frame(outer, bg=CORES["painel2"])
+        card.pack(side="left", fill="both", expand=True)
+
+        # Hover highlight
+        def _on_enter(e):
+            outer.config(highlightbackground=cor_borda)
+            card.config(bg=CORES["painel3"])
+            for w in card.winfo_children():
+                try:
+                    w.config(bg=CORES["painel3"])
+                except Exception:
+                    pass
+        def _on_leave(e):
+            outer.config(highlightbackground=CORES["borda"])
+            card.config(bg=CORES["painel2"])
+            for w in card.winfo_children():
+                try:
+                    w.config(bg=CORES["painel2"])
+                except Exception:
+                    pass
+        outer.bind("<Enter>", _on_enter)
+        outer.bind("<Leave>", _on_leave)
+        card.bind("<Enter>",  _on_enter)
+        card.bind("<Leave>",  _on_leave)
 
         # Preview do anuncio: recorte da pagina com borda vermelha,
         # ou a propria imagem embutida se nao houver coordenadas
@@ -4013,7 +4195,7 @@ class App(tk.Tk):
                          bg=CORES["painel2"], padx=6).pack(side="left")
 
         tk.Button(area_info,
-            text="Baixar PDF com marcacao", 
+            text="⬇  Baixar PDF com marcação",
             font=("Segoe UI", 9, "bold"),
             fg="#ffffff", bg=CORES["verde"],
             activebackground="#22a870",
@@ -4038,11 +4220,12 @@ class App(tk.Tk):
             messagebox.showerror("Erro", f"Arquivo nao encontrado:\n{pdf}")
             return
         self._buscando = True
-        self._btn_autores.config(text="Extraindo...", state="disabled",
+        self._btn_autores.config(text="⏳  Extraindo...", state="disabled",
                                  bg=CORES["painel2"], fg=CORES["texto3"])
         self._limpar_frame(self._frame_autores)
         self._barra.atualizar(0)
         self._lbl_status.config(text="Extraindo autores...", fg=CORES["texto2"])
+        self._lbl_status_ico.config(text="⟳", fg=CORES["amarelo"])
         self._abas.select(self._aba_autores)
         threading.Thread(
             target=extrair_todos_autores_pdf,
@@ -4054,15 +4237,17 @@ class App(tk.Tk):
         def atualizar():
             self._barra.atualizar(atual / total)
             self._lbl_progresso.config(
-                text=f"Pagina {atual}/{total}", fg=CORES["texto3"])
+                text=f"Pág {atual}/{total}", fg=CORES["texto3"])
             self._lbl_status.config(
-                text=f"Extraindo autores... {atual / total:.0%}", fg=CORES["texto2"])
+                text=f"Extraindo autores...  {atual / total:.0%}",
+                fg=CORES["texto2"])
+            self._lbl_status_ico.config(text="⟳", fg=CORES["amarelo"])
         self.after(0, atualizar)
 
     def _cb_resultado_autores(self, materias=None, total=0, erro=None):
         def atualizar():
             self._buscando = False
-            self._btn_autores.config(text="Extrair Autores", state="normal",
+            self._btn_autores.config(text="✎  Extrair Autores", state="normal",
                                      bg=CORES["painel2"], fg=CORES["texto2"])
             self._barra.atualizar(1.0 if not erro else 0.0)
             if erro:
@@ -4080,7 +4265,13 @@ class App(tk.Tk):
                 text=f"{len(com_autor)} autor(es) encontrado(s)  |  "
                      f"{len(sem_autor)} sem autor  |  {total} materia(s)",
                 fg=CORES["verde"] if com_autor else CORES["amarelo"])
+            self._lbl_status_ico.config(
+                text="✔" if com_autor else "◌",
+                fg=CORES["verde"] if com_autor else CORES["amarelo"])
             self._mostrar_autores(materias)
+            self._mostrar_toast(
+                f"✎  {len(com_autor)} autor(es) encontrado(s)",
+                CORES["lilas"], 2500)
         self.after(0, atualizar)
 
     # ── Extração A TARDE ──────────────────────────────────────────────────
@@ -4095,7 +4286,9 @@ class App(tk.Tk):
             messagebox.showwarning("Atenção", "Selecione um arquivo PDF primeiro.")
             return
 
-        self._btn_autores_atarde.config(text="Extraindo...", state="disabled")
+        self._btn_autores_atarde.config(text="⏳  Extraindo...", state="disabled")
+        self._lbl_status.config(text="Extraindo autores A TARDE...", fg=CORES["texto2"])
+        self._lbl_status_ico.config(text="⟳", fg=CORES["amarelo"])
         # Navega para a aba de resultado
         self._abas.select(self._aba_autores_atarde)
 
@@ -4117,11 +4310,14 @@ class App(tk.Tk):
 
     def _mostrar_autores_atarde(self, resultado):
         """Renderiza os resultados de extrair_autores_ataarde() na aba dedicada."""
-        self._btn_autores_atarde.config(text="Autores A TARDE", state="normal")
+        self._btn_autores_atarde.config(text="⬛  Autores A TARDE", state="normal")
         self._limpar_frame(self._frame_autores_atarde)
 
         erro = resultado.get("_erro")
         if erro:
+            self._lbl_status.config(text=f"Erro: {erro}", fg=CORES["vermelho"])
+            self._lbl_status_ico.config(text="✕", fg=CORES["vermelho"])
+            self._mostrar_toast(f"Erro: {erro}", CORES["vermelho"])
             tk.Label(self._frame_autores_atarde,
                      text=f"Erro: {erro}",
                      font=FONTE_LABEL, fg=CORES["vermelho"],
@@ -4129,6 +4325,12 @@ class App(tk.Tk):
             return
 
         total = resultado.get("total_autores", 0)
+        self._lbl_status.config(
+            text=f"{total} autor(es) A TARDE encontrado(s)",
+            fg=CORES["ciano"])
+        self._lbl_status_ico.config(text="✔", fg=CORES["ciano"])
+        self._mostrar_toast(f"⬛  {total} autor(es) A TARDE", CORES["ciano"], 2500)
+
         autores_unicos = resultado.get("autores_unicos", [])
         por_categoria = resultado.get("por_categoria", {})
         paginas_por_autor = resultado.get("paginas_por_autor", {})
@@ -4145,8 +4347,7 @@ class App(tk.Tk):
             texto = "\n".join(autores_unicos)
             self.clipboard_clear()
             self.clipboard_append(texto)
-            btn_copiar.config(text="✓ Copiado!", fg=CORES["verde"])
-            self.after(2000, lambda: btn_copiar.config(text="Copiar lista", fg=CORES["texto2"]))
+            self._mostrar_toast("✓  Lista copiada!", CORES["verde"], 2000)
 
         btn_copiar = tk.Button(cab, text="Copiar lista",
                                font=FONTE_PEQUENA, fg=CORES["texto2"],
@@ -4154,6 +4355,7 @@ class App(tk.Tk):
                                padx=10, pady=3, activebackground=CORES["painel2"],
                                command=_copiar_todos)
         btn_copiar.pack(side="right", anchor="e")
+        _btn_hover(btn_copiar, CORES["painel3"], CORES["azul"])
 
         # ── Seções por categoria ─────────────────────────────────────────
         COR_CAT = {
