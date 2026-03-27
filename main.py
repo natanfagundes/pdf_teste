@@ -3799,6 +3799,7 @@ class App(tk.Tk):
         total = resultado.get("total_autores", 0)
         autores_unicos = resultado.get("autores_unicos", [])
         por_categoria = resultado.get("por_categoria", {})
+        paginas_por_autor = resultado.get("paginas_por_autor", {})
 
         # ── Cabeçalho resumo ─────────────────────────────────────────────
         cab = tk.Frame(self._frame_autores_atarde, bg=CORES["painel2"],
@@ -3806,7 +3807,21 @@ class App(tk.Tk):
         cab.pack(fill="x", padx=8, pady=(0, 8))
         tk.Label(cab, text=f"Total de autores identificados: {total}",
                  font=("Segoe UI", 10, "bold"),
-                 fg=CORES["verde"], bg=CORES["painel2"]).pack(anchor="w")
+                 fg=CORES["verde"], bg=CORES["painel2"]).pack(side="left", anchor="w")
+
+        def _copiar_todos():
+            texto = "\n".join(autores_unicos)
+            self.clipboard_clear()
+            self.clipboard_append(texto)
+            btn_copiar.config(text="✓ Copiado!", fg=CORES["verde"])
+            self.after(2000, lambda: btn_copiar.config(text="Copiar lista", fg=CORES["texto2"]))
+
+        btn_copiar = tk.Button(cab, text="Copiar lista",
+                               font=FONTE_PEQUENA, fg=CORES["texto2"],
+                               bg=CORES["painel3"], relief="flat", cursor="hand2",
+                               padx=10, pady=3, activebackground=CORES["painel2"],
+                               command=_copiar_todos)
+        btn_copiar.pack(side="right", anchor="e")
 
         # ── Seções por categoria ─────────────────────────────────────────
         COR_CAT = {
@@ -3829,10 +3844,19 @@ class App(tk.Tk):
                      fg=cor, bg=CORES["painel2"]).pack(anchor="w", pady=(0, 4))
 
             for nome in nomes:
-                tk.Label(sec, text=f"  • {nome}",
+                pags = paginas_por_autor.get(nome, [])
+                sufixo = "  (p. " + ", ".join(str(p) for p in pags) + ")" if pags else ""
+                linha_nome = tk.Frame(sec, bg=CORES["painel2"])
+                linha_nome.pack(fill="x")
+                tk.Label(linha_nome, text=f"  • {nome}",
                          font=FONTE_LABEL, fg=CORES["texto"],
                          bg=CORES["painel2"], anchor="w"
-                         ).pack(fill="x")
+                         ).pack(side="left")
+                if sufixo:
+                    tk.Label(linha_nome, text=sufixo,
+                             font=FONTE_PEQUENA, fg=CORES["texto2"],
+                             bg=CORES["painel2"], anchor="w"
+                             ).pack(side="left")
 
         # ── Lista completa (alfabética) ──────────────────────────────────
         if autores_unicos:
@@ -3847,10 +3871,19 @@ class App(tk.Tk):
             grade.pack(fill="x")
             for i, nome in enumerate(autores_unicos):
                 col = i % 2
-                tk.Label(grade, text=f"  {nome}",
+                pags = paginas_por_autor.get(nome, [])
+                sufixo = "  (p. " + ", ".join(str(p) for p in pags) + ")" if pags else ""
+                celula = tk.Frame(grade, bg=CORES["painel2"])
+                celula.grid(row=i // 2, column=col, sticky="w", padx=(0, 20))
+                tk.Label(celula, text=f"  {nome}",
                          font=FONTE_PEQUENA, fg=CORES["texto2"],
                          bg=CORES["painel2"], anchor="w"
-                         ).grid(row=i // 2, column=col, sticky="w", padx=(0, 20))
+                         ).pack(side="left")
+                if sufixo:
+                    tk.Label(celula, text=sufixo,
+                             font=FONTE_PEQUENA, fg=CORES["texto3"],
+                             bg=CORES["painel2"], anchor="w"
+                             ).pack(side="left")
 
     def _montar_aba_buscar_autor(self, parent):
         """Monta a aba de busca de autores no PDF (3 modos)."""
