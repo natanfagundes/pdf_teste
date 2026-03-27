@@ -87,15 +87,20 @@ echo.
     --collect-binaries cv2 ^
     --collect-data skimage ^
     --collect-data imagehash ^
+    --collect-data numpy ^
     --hidden-import fitz ^
     --hidden-import fitz._fitz ^
     --hidden-import PIL ^
     --hidden-import PIL.ImageDraw ^
     --hidden-import PIL.ImageTk ^
+    --hidden-import PIL.ImageEnhance ^
+    --hidden-import PIL.ImageFilter ^
     --hidden-import pytesseract ^
     --hidden-import difflib ^
     --hidden-import unicodedata ^
     --hidden-import collections ^
+    --hidden-import hashlib ^
+    --hidden-import pathlib ^
     --hidden-import tkinter ^
     --hidden-import tkinter.ttk ^
     --hidden-import tkinter.filedialog ^
