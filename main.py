@@ -1,5 +1,7 @@
 import sys
 import io
+import os
+import hashlib
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -44,7 +46,7 @@ import fitz
 import numpy as np
 import imagehash
 import cv2
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageEnhance, ImageFilter
 from skimage.metrics import structural_similarity as ssim
 import pytesseract
 from difflib import SequenceMatcher
@@ -212,10 +214,76 @@ def identificar_formato(w_cm, h_cm, pag_w, pag_h):
     return "Faixa"
 
 PT_PARA_CM      = 2.54 / 72   # = 0.03527̄ cm/pt  (1" = 72pt = 2.54cm)
-TAMANHO_PHASH   = 16
-TAMANHO_SSIM    = (256, 256)
-MIN_MATCHES_ORB = 12
-DPI_RENDER      = 150
+TAMANHO_PHASH   = 32
+TAMANHO_SSIM    = (512, 512)
+MIN_MATCHES_ORB = 20
+DPI_RENDER      = 200
+DPI_SCAN        = 72   # DPI para varredura rapida por template matching (grayscale)
+
+# ── Cache de paginas renderizadas ─────────────────────────────────────────────
+# Evita re-abrir/re-renderizar o PDF a cada chamada de gerar_preview_anuncio
+# e a cada nova busca no mesmo arquivo. Armazena em ~/.dimensao_cache/
+_CACHE_DIR = Path.home() / ".dimensao_cache"
+
+
+def _hash_pdf(pdf_path: str) -> str:
+    """Hash do PDF baseado em caminho absoluto + tamanho + mtime."""
+    p = Path(pdf_path)
+    try:
+        stat = p.stat()
+        chave = f"{p.resolve()}|{stat.st_size}|{stat.st_mtime}"
+    except Exception:
+        chave = str(p.resolve())
+    return hashlib.md5(chave.encode()).hexdigest()[:16]
+
+
+def _cache_np_path(pdf_hash: str, num_pagina: int, dpi: int, gray: bool) -> Path:
+    suf = "g" if gray else ""
+    return _CACHE_DIR / f"{pdf_hash}_p{num_pagina:04d}_d{dpi}{suf}.npy"
+
+
+def _arr_do_cache(pdf_hash: str, num_pagina: int, dpi: int, gray: bool = False):
+    """Retorna array numpy lido do cache em disco, ou None se nao existir."""
+    p = _cache_np_path(pdf_hash, num_pagina, dpi, gray)
+    if p.exists():
+        try:
+            return np.load(str(p))
+        except Exception:
+            pass
+    return None
+
+
+def _salvar_no_cache(arr: np.ndarray, pdf_hash: str, num_pagina: int,
+                     dpi: int, gray: bool = False) -> None:
+    """Persiste array no cache. Remove os mais antigos se ultrapassar 400 arquivos."""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        p = _cache_np_path(pdf_hash, num_pagina, dpi, gray)
+        np.save(str(p), arr)
+        arquivos = sorted(_CACHE_DIR.glob("*.npy"), key=lambda f: f.stat().st_atime)
+        for f in arquivos[:-400]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _get_pagina_arr(pdf_path: str, num_pagina: int, dpi: int) -> np.ndarray:
+    """Array RGB (H x W x 3) uint8 da pagina (1-based), com cache em disco."""
+    pdf_hash = _hash_pdf(pdf_path)
+    arr = _arr_do_cache(pdf_hash, num_pagina, dpi)
+    if arr is None:
+        doc = fitz.open(pdf_path)
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        pix = doc[num_pagina - 1].get_pixmap(matrix=mat, alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, 3).copy()
+        doc.close()
+        _salvar_no_cache(arr, pdf_hash, num_pagina, dpi)
+    return arr
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def pontos_para_cm(pt):
@@ -274,13 +342,13 @@ def comparar_phash(img_a, img_b):
 def comparar_orb(img_a, img_b):
     cinza_a = cv2.cvtColor(pil_para_cv2(img_a), cv2.COLOR_BGR2GRAY)
     cinza_b = cv2.cvtColor(pil_para_cv2(img_b), cv2.COLOR_BGR2GRAY)
-    orb = cv2.ORB_create(nfeatures=1000)
+    orb = cv2.ORB_create(nfeatures=2000)
     kp_a, desc_a = orb.detectAndCompute(cinza_a, None)
     kp_b, desc_b = orb.detectAndCompute(cinza_b, None)
     if desc_a is None or desc_b is None or len(kp_a) < 5 or len(kp_b) < 5:
         return 0.0
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    bons = [m for m in matcher.match(desc_a, desc_b) if m.distance < 64]
+    bons = [m for m in matcher.match(desc_a, desc_b) if m.distance < 55]
     if len(bons) < MIN_MATCHES_ORB:
         return 0.0
     return min(1.0, len(bons) / min(len(kp_a), len(kp_b)))
@@ -295,8 +363,8 @@ def comparar_ssim(img_a, img_b):
 
 def comparar_tudo(img_a, img_b):
     return (
-        comparar_phash(img_a, img_b) * 0.40 +
-        comparar_orb(img_a, img_b)   * 0.35 +
+        comparar_phash(img_a, img_b) * 0.45 +
+        comparar_orb(img_a, img_b)   * 0.30 +
         comparar_ssim(img_a, img_b)  * 0.25
     )
 
@@ -320,12 +388,9 @@ def gerar_preview_anuncio(pdf_path, num_pagina, x_cm, y_cm, w_cm, h_cm,
     try:
         import PIL.ImageDraw as ImageDraw
 
-        doc = fitz.open(pdf_path)
-        pagina = doc[num_pagina - 1]
-        escala = DPI_RENDER / 72
-        pixmap = pagina.get_pixmap(matrix=fitz.Matrix(escala, escala), alpha=False)
-        img_pagina = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
-        doc.close()
+        # Usa cache: nao reabre nem re-renderiza o PDF se a pagina ja foi processada
+        arr = _get_pagina_arr(pdf_path, num_pagina, DPI_RENDER)
+        img_pagina = Image.fromarray(arr, "RGB")
 
         px_por_cm = DPI_RENDER / 2.54
         px = int(x_cm * px_por_cm)
@@ -340,19 +405,28 @@ def gerar_preview_anuncio(pdf_path, num_pagina, x_cm, y_cm, w_cm, h_cm,
         if pw < 5 or ph < 5:
             return None
 
-        # Desenha retangulo vermelho GROSSO na pagina inteira
+        # Borda azul fina ao redor do anuncio
         draw = ImageDraw.Draw(img_pagina)
-        espessura = max(6, int(px_por_cm * 0.18))
+        espessura = max(3, int(px_por_cm * 0.10))
         for i in range(espessura):
             draw.rectangle(
                 [px - i, py - i, px + pw + i, py + ph + i],
-                outline=(220, 30, 30)
+                outline=(69, 161, 237)
             )
 
-        # Redimensiona a pagina inteira para caber no card
-        ratio = largura_thumb / img_pagina.width
-        nova_h = int(img_pagina.height * ratio)
-        return img_pagina.resize((largura_thumb, nova_h), Image.LANCZOS)
+        # Recorta somente a regiao do anuncio com margem de contexto
+        margem_px = int(px_por_cm * 0.5)
+        crop_x0 = max(0, px - margem_px)
+        crop_y0 = max(0, py - margem_px)
+        crop_x1 = min(img_pagina.width,  px + pw + margem_px)
+        crop_y1 = min(img_pagina.height, py + ph + margem_px)
+        img_crop = img_pagina.crop((crop_x0, crop_y0, crop_x1, crop_y1))
+        if img_crop.width < 5 or img_crop.height < 5:
+            return None
+
+        ratio = largura_thumb / img_crop.width
+        nova_h = int(img_crop.height * ratio)
+        return img_crop.resize((largura_thumb, nova_h), Image.LANCZOS)
 
     except Exception:
         return None
@@ -423,9 +497,113 @@ def montar_candidatos(doc):
     return candidatos
 
 
+def _query_para_cinza(img_pil):
+    """Converte PIL Image para numpy uint8 grayscale."""
+    return cv2.cvtColor(np.array(img_pil.convert("RGB")), cv2.COLOR_RGB2GRAY)
+
+
+def _template_match_piramide(arr_query, arr_pagina):
+    """Template matching multi-escala com piramide de imagem (coarse-to-fine).
+
+    Estrategia:
+    1. Busca grossa: 11 proporcoes testadas em nivel baixo da piramide (~1/4 res)
+       -> muito rapido porque as imagens sao minusculas
+    2. Refinamento: top-3 candidatos da busca grossa sao refinados em sub-janela
+       da resolucao original -> preciso sem varrer a imagem inteira
+
+    Retorna (best_score, x_px, y_px, w_px, h_px) em coords da imagem original.
+    """
+    qh, qw = arr_query.shape[:2]
+    ph, pw = arr_pagina.shape[:2]
+    if qw < 8 or qh < 8 or pw < 20 or ph < 20:
+        return 0.0, 0, 0, qw, qh
+
+    # Escolhe nivel da piramide para busca grossa:
+    # pagina com ~120-200px de largura e o sweet-spot (rapido e ainda legivel)
+    nivel = 0
+    while (pw >> (nivel + 1)) >= 150 and nivel < 3:
+        nivel += 1
+    fator = 1 << nivel  # 2^nivel
+
+    pag_coarse = arr_pagina
+    for _ in range(nivel):
+        if pag_coarse.shape[1] < 30 or pag_coarse.shape[0] < 30:
+            break
+        pag_coarse = cv2.pyrDown(pag_coarse)
+    pch, pcw = pag_coarse.shape[:2]
+
+    # Busca grossa: testa 11 proporcoes da largura da pagina coarse
+    candidatos_grossos = []
+    for pct in [0.06, 0.10, 0.15, 0.21, 0.28, 0.37, 0.47, 0.58, 0.70, 0.82, 0.93]:
+        nw = int(pct * pcw)
+        nh = int(nw * qh / max(qw, 1))
+        if nw < 8 or nh < 8 or nw >= pcw or nh >= pch:
+            continue
+        q_c = cv2.resize(arr_query, (nw, nh), interpolation=cv2.INTER_AREA)
+        try:
+            res = cv2.matchTemplate(pag_coarse, q_c, cv2.TM_CCOEFF_NORMED)
+            _, val, _, loc = cv2.minMaxLoc(res)
+        except cv2.error:
+            continue
+        candidatos_grossos.append((val, pct, loc))
+
+    if not candidatos_grossos:
+        return 0.0, 0, 0, qw, qh
+
+    # Refinamento: top-3 candidatos na resolucao original, em sub-janela
+    candidatos_grossos.sort(reverse=True)
+    best_score = 0.0
+    best_loc   = (0, 0, qw, qh)
+
+    for val_c, pct, loc_c in candidatos_grossos[:3]:
+        nw_full = int(pct * pw)
+        nh_full = int(nw_full * qh / max(qw, 1))
+        if nw_full < 8 or nh_full < 8 or nw_full >= pw or nh_full >= ph:
+            continue
+
+        # Janela de refinamento ao redor do match grosseiro
+        cx = loc_c[0] * fator
+        cy = loc_c[1] * fator
+        mg = max(fator * 6, 12)
+        rx0 = max(0, cx - mg)
+        ry0 = max(0, cy - mg)
+        rx1 = min(pw - nw_full, cx + nw_full + mg)
+        ry1 = min(ph - nh_full, cy + nh_full + mg)
+
+        if rx1 > rx0 and ry1 > ry0:
+            patch    = arr_pagina[ry0:ry1 + nh_full, rx0:rx1 + nw_full]
+            offset_x = rx0
+            offset_y = ry0
+        else:
+            patch    = arr_pagina
+            offset_x = offset_y = 0
+
+        q_full = cv2.resize(arr_query, (nw_full, nh_full), interpolation=cv2.INTER_LINEAR)
+        try:
+            res = cv2.matchTemplate(patch, q_full, cv2.TM_CCOEFF_NORMED)
+            _, val_f, _, loc_f = cv2.minMaxLoc(res)
+        except cv2.error:
+            continue
+
+        if val_f > best_score:
+            best_score = val_f
+            best_loc   = (loc_f[0] + offset_x, loc_f[1] + offset_y, nw_full, nh_full)
+
+    return max(0.0, float(best_score)), best_loc[0], best_loc[1], best_loc[2], best_loc[3]
+
+
 def buscar_imagem_no_pdf(pdf_path, imagens_busca, funcao_comparacao,
                          limiar, cb_progresso, cb_resultado):
-    """imagens_busca pode ser uma PIL.Image ou lista de PIL.Images."""
+    """imagens_busca: PIL.Image ou lista de PIL.Images.
+
+    Estrategia multi-camada:
+    1. Imagens embutidas no PDF: comparacao por funcao_comparacao (phash/orb/ssim/all)
+    2. Template matching com piramide coarse-to-fine + cache de paginas em disco
+    3. OCR hibrido: fallback textual quando o visual falha
+       - Extrai texto OCR das imagens de busca uma unica vez
+       - Compara contra texto nativo do PDF (rapido, sem re-OCR)
+       - Se texto bate, localiza o bloco de texto na pagina para ter coordenadas
+    """
     if not isinstance(imagens_busca, list):
         imagens_busca = [imagens_busca]
 
@@ -435,64 +613,179 @@ def buscar_imagem_no_pdf(pdf_path, imagens_busca, funcao_comparacao,
         cb_resultado(erro=str(e))
         return
 
-    candidatos = montar_candidatos(doc)
-    doc.close()
-
-    if not candidatos:
-        cb_resultado(erro="Nao foi possivel extrair nenhuma imagem do PDF.")
+    num_paginas = len(doc)
+    if num_paginas == 0:
+        cb_resultado(erro="PDF vazio.")
         return
 
-    total = len(candidatos)
-    matches = []
+    # Pre-processa queries: grayscale numpy para template matching
+    queries_cinza = [_query_para_cinza(img) for img in imagens_busca]
+
+    # OCR nas imagens de busca (feito uma unica vez, antes do loop de paginas)
+    textos_query_ocr = []
+    for img_q in imagens_busca:
+        try:
+            textos_query_ocr.append(ocr_de_pil(img_q))
+        except Exception:
+            textos_query_ocr.append("")
+    # Liga o fallback OCR apenas se pelo menos uma query tem texto suficiente
+    tem_ocr = any(len(t.split()) >= 5 for t in textos_query_ocr)
+
+    pdf_hash       = _hash_pdf(pdf_path)
+    px_por_cm_scan = DPI_SCAN / 2.54
+    mat_scan       = fitz.Matrix(DPI_SCAN / 72, DPI_SCAN / 72)
+
+    matches_raw  = []
     melhor_score = 0.0
 
-    for i, cand in enumerate(candidatos):
-        # Score maximo entre todas as imagens de busca
-        score = 0.0
-        img_match = None
-        for img_busca in imagens_busca:
+    for num_pagina in range(num_paginas):
+        pagina = doc[num_pagina]
+        pag_w, pag_h = pegar_tamanho_pagina_cm(pagina)
+
+        # ── 1. Imagens embutidas ──────────────────────────────────────────
+        for info_img in pagina.get_images(full=True):
+            xref = info_img[0]
             try:
-                s = funcao_comparacao(img_busca, cand["imagem"])
+                dados   = doc.extract_image(xref)
+                img_emb = Image.open(io.BytesIO(dados["image"])).convert("RGB")
+                if img_emb.width < 40 or img_emb.height < 40:
+                    continue
+                best_s = 0.0; best_qi = 0
+                for qi, img_q in enumerate(imagens_busca):
+                    try:
+                        s = funcao_comparacao(img_q, img_emb)
+                    except Exception:
+                        s = 0.0
+                    if s > best_s:
+                        best_s = s; best_qi = qi
+                if best_s > melhor_score:
+                    melhor_score = best_s
+                if best_s >= limiar:
+                    pos = pegar_posicao_imagem_cm(pagina, xref)
+                    matches_raw.append({
+                        "pagina": num_pagina + 1, "score": best_s,
+                        "x_cm":   pos["x_cm"] if pos else 0.0,
+                        "y_cm":   pos["y_cm"] if pos else 0.0,
+                        "w_cm":   pos["w_cm"] if pos else pontos_para_cm(img_emb.width),
+                        "h_cm":   pos["h_cm"] if pos else pontos_para_cm(img_emb.height),
+                        "pag_w":  pag_w, "pag_h": pag_h,
+                        "qi":     best_qi, "fonte": "embutida",
+                    })
             except Exception:
-                s = 0.0
-            if s > score:
-                score = s
-                img_match = img_busca
+                pass
 
-        if score > melhor_score:
-            melhor_score = score
+        # ── 2. Template matching com piramide + cache ─────────────────────
+        # Usa cache: na 2a busca no mesmo PDF, carrega do disco (sem re-renderizar)
+        arr_scan = _arr_do_cache(pdf_hash, num_pagina + 1, DPI_SCAN, gray=True)
+        if arr_scan is None:
+            try:
+                pix = pagina.get_pixmap(matrix=mat_scan, alpha=False,
+                                        colorspace=fitz.csGRAY)
+                arr_scan = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                    pix.height, pix.width).copy()
+                _salvar_no_cache(arr_scan, pdf_hash, num_pagina + 1, DPI_SCAN, gray=True)
+            except Exception:
+                arr_scan = None
 
-        if score >= limiar:
-            thumb = cand["imagem"].copy()
-            thumb.thumbnail((120, 120), Image.LANCZOS)
+        best_template = None
+        if arr_scan is not None:
+            for qi, arr_q in enumerate(queries_cinza):
+                try:
+                    s, tx, ty, tw, th = _template_match_piramide(arr_q, arr_scan)
+                except Exception:
+                    s = 0.0; tx = ty = tw = th = 0
+                if s > melhor_score:
+                    melhor_score = s
+                if best_template is None or s > best_template["score"]:
+                    best_template = {
+                        "score": s, "qi": qi,
+                        "x_cm":  tx / px_por_cm_scan,
+                        "y_cm":  ty / px_por_cm_scan,
+                        "w_cm":  tw / px_por_cm_scan,
+                        "h_cm":  th / px_por_cm_scan,
+                    }
 
-            # Tenta gerar preview recortado da pagina (com borda vermelha)
-            # Se nao tiver coordenadas, usa a propria imagem embutida redimensionada
-            preview = None
-            if cand.get("x_cm") is not None and cand.get("w_cm"):
-                preview = gerar_preview_anuncio(
-                    pdf_path, cand["pagina"],
-                    cand["x_cm"], cand["y_cm"],
-                    cand["w_cm"], cand["h_cm"])
-
-            if preview is None:
-                # Fallback: usa a propria imagem embutida como preview
-                preview = cand["imagem"].copy()
-                preview.thumbnail((200, 400), Image.LANCZOS)
-
-            matches.append({
-                **cand,
-                "score":   score,
-                "thumb":   thumb,
-                "preview": preview,
-                "w_px":    cand["imagem"].width,
-                "h_px":    cand["imagem"].height,
-                "img_match_idx": imagens_busca.index(img_match) + 1 if img_match else 1,
+        if best_template and best_template["score"] >= limiar:
+            matches_raw.append({
+                "pagina": num_pagina + 1, "pag_w": pag_w, "pag_h": pag_h,
+                "fonte": "template",
+                **{k: best_template[k] for k in ("score","x_cm","y_cm","w_cm","h_cm","qi")},
             })
 
-        cb_progresso(i + 1, total, cand["pagina"])
+        # ── 3. OCR hibrido: fallback quando template nao encontrou ────────
+        # Compara o texto OCR das imagens de busca com o texto nativo do PDF.
+        # Nao exige re-OCR do PDF (usa get_text do fitz, muito rapido).
+        template_achou = best_template and best_template["score"] >= limiar
+        if tem_ocr and not template_achou:
+            texto_pag = pagina.get_text("text").strip()
+            if texto_pag:
+                for qi, texto_q in enumerate(textos_query_ocr):
+                    if not texto_q or len(texto_q.split()) < 5:
+                        continue
+                    ts = calcular_score_texto(texto_q, texto_pag)
+                    score_ocr = ts * 0.82  # desconto: localizacao menos precisa
+                    if score_ocr > melhor_score:
+                        melhor_score = score_ocr
+                    if score_ocr >= limiar:
+                        # Encontra o bloco com maior similaridade para ter coordenadas
+                        blocos_pag = [b for b in pagina.get_text("blocks")
+                                      if len(b[4].strip()) >= 10]
+                        melhor_b = max(
+                            blocos_pag,
+                            key=lambda b: calcular_score_texto(texto_q, b[4]),
+                            default=None
+                        )
+                        if melhor_b:
+                            bx = pontos_para_cm(melhor_b[0])
+                            by = pontos_para_cm(melhor_b[1])
+                            bw = pontos_para_cm(melhor_b[2] - melhor_b[0])
+                            bh = pontos_para_cm(melhor_b[3] - melhor_b[1])
+                        else:
+                            bx, by, bw, bh = 0.0, 0.0, pag_w, pag_h
+                        matches_raw.append({
+                            "pagina": num_pagina + 1, "score": score_ocr,
+                            "x_cm": bx, "y_cm": by, "w_cm": bw, "h_cm": bh,
+                            "pag_w": pag_w, "pag_h": pag_h,
+                            "qi": qi, "fonte": "ocr",
+                        })
 
-    cb_resultado(matches=matches, melhor_score=melhor_score, total=total, erro=None)
+        cb_progresso(num_pagina + 1, num_paginas, num_pagina + 1)
+
+    doc.close()
+
+    # Deduplica: mantem apenas o melhor score por regiao proxima
+    matches_raw.sort(key=lambda x: x["score"], reverse=True)
+    regioes_vistas = []
+    matches_finais = []
+    for m in matches_raw:
+        sobrepoe = any(
+            m["pagina"] == r["pagina"]
+            and abs(m["x_cm"] - r["x_cm"]) < 2.0
+            and abs(m["y_cm"] - r["y_cm"]) < 2.0
+            for r in regioes_vistas
+        )
+        if sobrepoe:
+            continue
+        regioes_vistas.append({"pagina": m["pagina"], "x_cm": m["x_cm"], "y_cm": m["y_cm"]})
+
+        preview = gerar_preview_anuncio(
+            pdf_path, m["pagina"], m["x_cm"], m["y_cm"], m["w_cm"], m["h_cm"])
+        if preview is None:
+            preview = imagens_busca[m["qi"]].copy()
+            preview.thumbnail((200, 400), Image.LANCZOS)
+
+        img_q = imagens_busca[m["qi"]]
+        matches_finais.append({
+            **m,
+            "preview":       preview,
+            "thumb":         img_q.copy(),
+            "w_px":          img_q.width,
+            "h_px":          img_q.height,
+            "img_match_idx": m["qi"] + 1,
+        })
+
+    cb_resultado(matches=matches_finais, melhor_score=melhor_score,
+                 total=num_paginas, erro=None)
 
 
 def _agrupar_regioes(regioes_pt, tolerancia=8):
@@ -2096,12 +2389,24 @@ def trecho_representativo(texto_pdf, max_chars=400):
     return limpo[:max_chars]
 
 
-def ocr_da_imagem(caminho_img):
-    img = Image.open(caminho_img).convert("RGB")
-    # Usa PSM 6 (bloco uniforme de texto) — melhor para anuncios
-    config = "--psm 6 -l por+eng"
-    texto = pytesseract.image_to_string(img, config=config)
-    return texto.strip()
+def ocr_de_pil(img_pil: Image.Image) -> str:
+    """OCR em uma PIL Image diretamente (sem arquivo temporario).
+    Usado tanto pelo botao de OCR quanto pelo fallback hibrido de busca por imagem."""
+    LARGURA_MIN = 1800
+    img = img_pil.convert("RGB")
+    if img.width < LARGURA_MIN:
+        fator = LARGURA_MIN / img.width
+        img = img.resize((LARGURA_MIN, int(img.height * fator)), Image.LANCZOS)
+    cinza = img.convert("L")
+    cinza = ImageEnhance.Contrast(cinza).enhance(2.0)
+    cinza = cinza.filter(ImageFilter.SHARPEN)
+    config = "--oem 1 --psm 3 -l por+eng"
+    return pytesseract.image_to_string(cinza, config=config).strip()
+
+
+def ocr_da_imagem(caminho_img: str) -> str:
+    """OCR em arquivo de imagem. Delegates para ocr_de_pil."""
+    return ocr_de_pil(Image.open(caminho_img))
 
 
 def extrair_blocos_por_pagina(pdf_path):
@@ -2155,6 +2460,14 @@ def bbox_expandido(bloco_match, todos_blocos, tolerancia_pt=10):
 
 
 def buscar_texto_no_pdf(pdf_path, texto_busca, limiar, cb_progresso, cb_resultado):
+    """Busca texto_busca no PDF usando indice invertido por palavra.
+
+    Indice invertido:
+    - Constroi mapa palavra->blocos para cada pagina
+    - Filtra blocos candidatos: so avalia blocos que compartilham >= 1 palavra
+      com a busca — elimina 90%+ das comparacoes
+    - Janela deslizante apenas ao redor dos blocos candidatos (nao O(n^2))
+    """
     try:
         paginas = extrair_blocos_por_pagina(pdf_path)
     except Exception as e:
@@ -2165,26 +2478,50 @@ def buscar_texto_no_pdf(pdf_path, texto_busca, limiar, cb_progresso, cb_resultad
         cb_resultado(erro="Nenhum texto encontrado no PDF.")
         return
 
-    # Monta lista de candidatos: blocos individuais + grupos de blocos vizinhos
-    candidatos = []
-    for num_pagina, info in paginas.items():
+    palavras_q   = palavras_relevantes(texto_busca)
+    total_paginas = len(paginas)
+    scored       = []
+    melhor_score = 0.0
+
+    for i, (num_pagina, info) in enumerate(paginas.items()):
         blocos = info["blocos"]
         pag_w  = info["pag_w"]
         pag_h  = info["pag_h"]
 
-        for b in blocos:
-            candidatos.append({
-                "pagina":      num_pagina,
-                "texto":       b["texto"],
-                "bloco_orig":  b,
-                "pag_w":       pag_w,
-                "pag_h":       pag_h,
-                "todos_blocos": blocos,
-            })
+        if not blocos:
+            cb_progresso(i + 1, total_paginas, num_pagina)
+            continue
 
-        for tamanho in range(2, min(12, len(blocos) + 1)):
-            for inicio in range(len(blocos) - tamanho + 1):
-                grupo = blocos[inicio:inicio + tamanho]
+        # ── Indice invertido desta pagina: palavra -> set(indices de blocos) ────
+        # Permite filtrar 90%+ dos blocos sem nenhum calculo de score
+        idx_bloco: dict = {}
+        for bi, bloco in enumerate(blocos):
+            for p in palavras_relevantes(bloco["texto"]):
+                idx_bloco.setdefault(p, set()).add(bi)
+
+        # Blocos que compartilham pelo menos 1 palavra com a busca
+        candidatos_idx = set()
+        for p in palavras_q:
+            candidatos_idx |= idx_bloco.get(p, set())
+
+        if not candidatos_idx:
+            cb_progresso(i + 1, total_paginas, num_pagina)
+            continue
+
+        # Para cada bloco candidato: avalia individualmente e em janelas com vizinhos
+        vistos: set = set()
+        for bi in sorted(candidatos_idx):
+            # Janela: do bloco (bi-2) ao (bi+10)
+            ini     = max(0, bi - 2)
+            fim_max = min(len(blocos), bi + 11)
+
+            for tam in range(1, fim_max - ini + 1):
+                fim = ini + tam
+                chave = (ini, fim)
+                if chave in vistos:
+                    continue
+                vistos.add(chave)
+                grupo = blocos[ini:fim]
                 texto_grupo = " ".join(b["texto"] for b in grupo)
                 bloco_virtual = {
                     "x0": min(b["x0"] for b in grupo),
@@ -2192,28 +2529,22 @@ def buscar_texto_no_pdf(pdf_path, texto_busca, limiar, cb_progresso, cb_resultad
                     "x1": max(b["x1"] for b in grupo),
                     "y1": max(b["y1"] for b in grupo),
                 }
-                candidatos.append({
-                    "pagina":       num_pagina,
-                    "texto":        texto_grupo,
-                    "bloco_orig":   bloco_virtual,
-                    "pag_w":        pag_w,
-                    "pag_h":        pag_h,
-                    "todos_blocos": blocos,
-                })
+                score = calcular_score_texto(texto_busca, texto_grupo)
+                if score > melhor_score:
+                    melhor_score = score
+                if score >= limiar:
+                    scored.append((score, {
+                        "pagina":       num_pagina,
+                        "texto":        texto_grupo,
+                        "bloco_orig":   bloco_virtual,
+                        "pag_w":        pag_w,
+                        "pag_h":        pag_h,
+                        "todos_blocos": blocos,
+                    }))
 
-    total = len(candidatos)
-    scored = []
-    melhor_score = 0.0
+        cb_progresso(i + 1, total_paginas, num_pagina)
 
-    for i, cand in enumerate(candidatos):
-        score = calcular_score_texto(texto_busca, cand["texto"])
-        if score > melhor_score:
-            melhor_score = score
-        if score >= limiar:
-            scored.append((score, cand))
-        cb_progresso(i + 1, total, cand["pagina"])
-
-    # Para cada match, expande o bounding box para incluir blocos vizinhos
+    # Expande bbox e deduplica
     matches_unicos = []
     regioes_vistas = []
 
@@ -2226,32 +2557,33 @@ def buscar_texto_no_pdf(pdf_path, texto_busca, limiar, cb_progresso, cb_resultad
         w_cm = pontos_para_cm(x1 - x0)
         h_cm = pontos_para_cm(y1 - y0)
 
-        sobrepoe = False
-        for r in regioes_vistas:
-            if (cand["pagina"] == r["pagina"]
-                    and abs(x_cm - r["x_cm"]) < 1.5
-                    and abs(y_cm - r["y_cm"]) < 1.5):
-                sobrepoe = True
-                break
+        sobrepoe = any(
+            cand["pagina"] == r["pagina"]
+            and abs(x_cm - r["x_cm"]) < 1.5
+            and abs(y_cm - r["y_cm"]) < 1.5
+            for r in regioes_vistas
+        )
+        if sobrepoe:
+            continue
 
-        if not sobrepoe:
-            regioes_vistas.append({"pagina": cand["pagina"], "x_cm": x_cm, "y_cm": y_cm})
-            preview = gerar_preview_anuncio(
-                pdf_path, cand["pagina"], x_cm, y_cm, w_cm, h_cm)
-            matches_unicos.append({
-                "pagina":  cand["pagina"],
-                "score":   score,
-                "trecho":  trecho_representativo(cand["texto"]),
-                "x_cm":    x_cm,
-                "y_cm":    y_cm,
-                "w_cm":    w_cm,
-                "h_cm":    h_cm,
-                "pag_w":   cand["pag_w"],
-                "pag_h":   cand["pag_h"],
-                "preview": preview,
-            })
+        regioes_vistas.append({"pagina": cand["pagina"], "x_cm": x_cm, "y_cm": y_cm})
+        preview = gerar_preview_anuncio(
+            pdf_path, cand["pagina"], x_cm, y_cm, w_cm, h_cm)
+        matches_unicos.append({
+            "pagina":  cand["pagina"],
+            "score":   score,
+            "trecho":  trecho_representativo(cand["texto"]),
+            "x_cm":    x_cm,
+            "y_cm":    y_cm,
+            "w_cm":    w_cm,
+            "h_cm":    h_cm,
+            "pag_w":   cand["pag_w"],
+            "pag_h":   cand["pag_h"],
+            "preview": preview,
+        })
 
-    cb_resultado(matches=matches_unicos, melhor_score=melhor_score, total=total, erro=None)
+    cb_resultado(matches=matches_unicos, melhor_score=melhor_score,
+                 total=total_paginas, erro=None)
 
 
 class BotaoArquivo(tk.Label):
